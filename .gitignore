@@ -1,0 +1,4 @@
+node_modules/
+*.log
+crawl_cache*.json
+theory_wide*.json
