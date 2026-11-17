@@ -1,0 +1,29 @@
+Italian Game (White)               identity 5 plies, my moves checked  32, cut 1, unknown 0, lines 7 -> 6
+    ply 21 g2g4 (loses 147cp), best c3e4
+Ruy Lopez (White)                  identity 5 plies, my moves checked  72, cut 1, unknown 0, lines 10 -> 9
+    ply 23 d2f1 (loses 92cp), best d4d5
+Queen's Gambit (White)             identity 3 plies, my moves checked  81, cut 0, unknown 0, lines 12 -> 11
+London System (White)              identity 5 plies, my moves checked   4, cut 0, unknown 0, lines 2 -> 2
+Sicilian Defense (Black)           identity 2 plies, my moves checked  88, cut 1, unknown 0, lines 12 -> 11
+    ply 18 a8a7 (loses 116cp), best g8e7
+Caro-Kann Defense (Black)          identity 2 plies, my moves checked  51, cut 0, unknown 0, lines 10 -> 10
+French Defense (Black)             identity 2 plies, my moves checked  57, cut 0, unknown 0, lines 10 -> 9
+Scandinavian Defense (Black)       identity 8 plies, my moves checked   2, cut 0, unknown 0, lines 2 -> 1
+King's Indian Defense (Black)      identity 4 plies, my moves checked  73, cut 0, unknown 0, lines 10 -> 9
+King's Gambit (White)              identity 3 plies, my moves checked  77, cut 4, unknown 0, lines 20 -> 20
+    ply 9 g2g3 (loses 75cp), best e1f1
+    ply 9 g2g4 (loses 92cp), best d2d4
+    ply 15 g2g4 (loses 118cp), best b1c3
+    ply 7 f1c4 (loses 92cp), best d2d4
+Danish Gambit (White)              identity 8 plies, my moves checked   4, cut 0, unknown 0, lines 1 -> 1
+Evans Gambit (White)               identity 7 plies, my moves checked  44, cut 1, unknown 0, lines 8 -> 8
+    ply 13 d2d4 (loses 143cp), best c4e2
+Smith-Morra Gambit (White)         identity 5 plies, my moves checked  16, cut 0, unknown 0, lines 4 -> 4
+Scotch Gambit (White)              identity 7 plies, my moves checked  16, cut 0, unknown 0, lines 4 -> 3
+Vienna Gambit (White)              identity 8 plies, my moves checked   2, cut 0, unknown 0, lines 1 -> 1
+Blackmar-Diemer Gambit (White)     identity 7 plies, my moves checked  20, cut 2, unknown 0, lines 6 -> 5
+    ply 15 e1g1 (loses 72cp), best a2a3
+    ply 15 e1g1 (loses 72cp), best a2a3
+Budapest Gambit (Black)            identity 6 plies, my moves checked   6, cut 0, unknown 0, lines 2 -> 2
+Albin Countergambit (Black)        identity 6 plies, my moves checked   9, cut 0, unknown 0, lines 3 -> 3
+Benko Gambit (Black)               identity 8 plies, my moves checked  14, cut 0, unknown 0, lines 4 -> 4
