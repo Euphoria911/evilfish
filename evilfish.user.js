@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Evilfish
 // @namespace    https://chess.com
-// @version      4.2.0
+// @version      4.2.1
 // @description  Stockfish 19 for chess.com: engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move, optional human-like play for the weaker strength tiers
 // @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
-  const VERSION       = '4.2.0';
+  const VERSION       = '4.2.1';
   const MULTI_PV      = 3;
   const AUTO_MOVE_KEY = 'KeyA';   // Alt+A
   const START_FEN     = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -63,12 +63,17 @@
     { name: 'deep',     movetime: 0   },   // fixed depth, soft-stopped after 20 s
     { name: 'auto',     movetime: -1  }    // clock-aware
   ];
+  // Strength ladder. 'elo' is only the name shown in the menu; 'uci' is the UCI_Elo actually sent to the engine, and
+  // 'skill' the Skill Level. The two Stockfish scales (UCI_Elo and Skill Level) don't line up, so the values were
+  // measured in engine-vs-engine matches to give an ordered ladder with roughly even steps. The stronger tier beat
+  // its neighbour by about: 80 over 70 +130 · 70 over 60 +150 · 60 over 45 +220 · 45 over 30 +160 · 30 over 20 +230 Elo.
+  // (Before this, 60% played far weaker than 20%, and 45% was about as strong as 80%.)
   const TIERS = [
     { acc: 100, mode: 'max',   depth: 22, elo: null                },
-    { acc:  80, mode: 'elo',   depth: 12, elo: 1700                },
-    { acc:  70, mode: 'elo',   depth: 12, elo: 1500                },
-    { acc:  60, mode: 'elo',   depth: 12, elo: 1350                },
-    { acc:  45, mode: 'skill', depth:  6, elo:  900, skill: 4      },
+    { acc:  80, mode: 'elo',   depth: 12, elo: 1700, uci: 2200    },
+    { acc:  70, mode: 'elo',   depth: 12, elo: 1500, uci: 2000    },
+    { acc:  60, mode: 'elo',   depth: 12, elo: 1350, uci: 1700    },
+    { acc:  45, mode: 'skill', depth:  4, elo:  900, skill: 2      },
     { acc:  30, mode: 'skill', depth:  4, elo:  700, skill: 1      },
     { acc:  20, mode: 'skill', depth:  2, elo:  500, skill: 0      },
   ];
@@ -959,7 +964,7 @@
     } else if (t.mode === 'elo') {
       send(E, 'setoption name Skill Level value 20');
       send(E, 'setoption name UCI_LimitStrength value true');
-      send(E, `setoption name UCI_Elo value ${t.elo}`);
+      send(E, `setoption name UCI_Elo value ${t.uci ?? t.elo}`);
     } else {
       send(E, 'setoption name UCI_LimitStrength value false');
       send(E, `setoption name Skill Level value ${t.skill}`);
@@ -1201,8 +1206,8 @@
   //  · now and then it simply slips and plays a worse candidate.
   // d = look-ahead depth, k = candidates considered, T = softness of the choice (cp), pb = chance of a slip,
   // notice = chance of seeing that a move leaves a piece en prise. Tuned by engine-vs-engine matches (see the ladder below).
-  // A monotonic ladder (80% strongest), calibrated by engine-vs-engine matches against the 45% engine tier
-  // (Stockfish skill 4, depth 6) for 80-30%, and against the 30% engine tier for 30% and 20%.
+  // A monotonic ladder (80% strongest), calibrated by engine-vs-engine matches against the former 45% engine config
+  // (Stockfish skill 4, depth 6) for 80-30%, and against the former 30% config (skill 1, depth 4) for 30% and 20%.
   // Roughly: 80% ≈ equal · 70% ≈ -150 · 60% ≈ -220 · 45% ≈ -270 · 30% ≈ -400 · 20% ≈ -550 (Elo, ±100).
   const HUMAN = {
     1: { d: 5, k: 5, T: 55,  pb: 0.012, notice: 0.97 },     // 80%
