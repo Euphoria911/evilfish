@@ -168,6 +168,8 @@
   let forcedSide  = null;
   let showPreMove = true;
   let showThreats = true;
+  let playForWin  = !!Number(store.get('eni-fight', 1));
+  let lastEvalMe  = null;     // my evaluation (centipawns, my point of view) from the previous search
   let displayRank = -1;
   let displayedOpeningSide = null;
   let currentOpening = '';
@@ -739,6 +741,7 @@
     if (!sameGame) {
       pendingPreMoves = [];
       currentOpening = '';
+      lastEvalMe = null;
       if (eng) eng.newGame = true;
     }
     lastAutoMoveKey = '';
@@ -1162,6 +1165,8 @@
       st, fen: st.fen, position, multiPV, depth, movetime, budget,
       ponder: !!opts.ponder, extended: false,
       earlyStop: maxTier && budget > 0 && speed.name !== 'deep',
+      fight: playForWin && maxTier && meTurn && !lowTime && !opts.ponder && budget > 0,
+      surpriseExtend: maxTier && meTurn && !lowTime && !opts.ponder && budget > 0 && speed.name !== 'deep',
       extendFactor: 0.7,
       allowExtend: maxTier && meTurn && budget > 0 && speed.name !== 'fast' && speed.name !== 'deep' && !lowTime && !opts.ponder
     };
@@ -1182,6 +1187,67 @@
     return reconcileTablebase(fen, list);
   }
 
+  // ── PLAY FOR A WIN ────────────────────────────────────────────────────────
+  // Level positions are where a strong engine drifts into draws: it is happy to repeat or to trade everything off.
+  // When the best move is roughly level, choose among the moves that are practically as good (within FIGHT.tol cp)
+  // the one that does not repeat an earlier position and keeps the pieces on the board. A clearly better position is
+  // always converted with the best move, and a worse one is never gambled with.
+  const FIGHT = { band: 60, worse: -25, tol: 12 };
+
+  function fightDrawish(entry) {
+    return !!entry && Number.isInteger(entry.scoreRaw) && !Number.isInteger(entry.mateScore) &&
+           Math.abs(entry.scoreRaw) <= FIGHT.band && entry.scoreRaw >= FIGHT.worse;
+  }
+
+  function positionCounts(st) {
+    const counts = new Map();
+    let f = st.startFEN || st.fen;
+    counts.set(openingKey(f), 1);
+    for (const m of st.moves || []) {
+      f = stepFEN(f, m);
+      if (!f) break;
+      const k = openingKey(f);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    return counts;
+  }
+
+  function capturesInPV(fen, pv, plies = 6) {
+    const board = boardFromPlacement(fen.split(' ')[0]);
+    let n = 0;
+    for (const m of pv.slice(0, plies)) {
+      const from = m.slice(0, 2), to = m.slice(2, 4), p = board[from];
+      if (!p) break;
+      if (board[to] || (/[pP]/.test(p) && from[0] !== to[0])) n++;
+      applyMove(board, m);
+    }
+    return n;
+  }
+
+  function pickFighting(st, list) {
+    if (!list || list.length < 2 || !fightDrawish(list[0])) return list;
+    const best = list[0];
+    const counts = positionCounts(st);
+    const pieces = (st.fen.split(' ')[0].match(/[a-zA-Z]/g) || []).length;
+    const cands = list.filter(e => Number.isInteger(e.scoreRaw) && !Number.isInteger(e.mateScore) && best.scoreRaw - e.scoreRaw <= FIGHT.tol)
+      .map(e => {
+        const next = stepFEN(st.fen, e.move);
+        return { e, repeat: next ? (counts.get(openingKey(next)) || 0) : 0,
+                 caps: pieces > 10 ? capturesInPV(st.fen, e.pv && e.pv.length ? e.pv : [e.move]) : 0 };
+      });
+    if (cands.length < 2) return list;
+    cands.sort((a, b) => a.repeat - b.repeat || a.caps - b.caps || b.e.scoreRaw - a.e.scoreRaw);
+    const pick = cands[0].e;
+    if (pick === best) return list;
+    return [Object.assign({}, pick, { fight: true })].concat(list.filter(e => e !== pick));
+  }
+
+  // a second look at a level position with three lines, so there is something to choose between
+  function fightPassJob(job) {
+    return Object.assign({}, job, { multiPV: 3, movetime: Math.max(200, Math.round(job.budget * 0.8)),
+                                    fightPass: true, earlyStop: false, allowExtend: false, extended: true });
+  }
+
   function handleResult(E, job, line) {
     const list = buildList(E, job, line);
     if (job.ponder) {                       // finished before the opponent moved: keep it for the hit
@@ -1191,17 +1257,31 @@
       return;
     }
     if (!pos || job.fen !== pos.fen) return;
-    if (job.allowExtend && !job.extended && list.length && unsettled(E.hist)) {
-      dbg('search unsettled; extending');
+    // the opponent's last move made things much worse than I expected: something tactical is going on, look longer
+    const nowEval = Number.isInteger(list[0]?.scoreRaw) ? list[0].scoreRaw * (turnOf(job.fen) === mySide() ? 1 : -1) : null;
+    const surprised = job.surpriseExtend && !job.extended && nowEval !== null && lastEvalMe !== null && nowEval - lastEvalMe < -80;
+    if (nowEval !== null) lastEvalMe = nowEval;
+    if (list.length && ((job.allowExtend && !job.extended && unsettled(E.hist)) || surprised)) {
+      dbg(surprised ? 'unexpected drop in evaluation; extending' : 'search unsettled; extending');
       requestSearch(Object.assign({}, job, { movetime: Math.round(job.budget * job.extendFactor), extended: true, allowExtend: false, earlyStop: false }));
       return;
     }
-    top3 = list;
+    let chosen = list;
+    if (job.fight && list.length && fightDrawish(list[0])) {
+      if (job.multiPV < 2 && !job.fightPass) {         // level position, only one line so far: look at three
+        dbg('level position; looking for a winning try');
+        requestSearch(fightPassJob(job));
+        return;
+      }
+      chosen = pickFighting(job.st, list);
+      if (chosen !== list) dbg(`play for win: ${list[0].move} -> ${chosen[0].move}`);
+    }
+    top3 = chosen;
     top3FEN = job.fen;
     workerRestarts = 0;
-    dbg(`result ${E.kind}: ${list.map(t => t.move).join(' | ')}${job.hit ? ' (ponder hit)' : ''}`);
+    dbg(`result ${E.kind}: ${chosen.map(t => t.move).join(' | ')}${job.hit ? ' (ponder hit)' : ''}`);
     finalize(job.st);
-    if (list.length) startPonder(job.st, list);
+    if (chosen.length) startPonder(job.st, chosen);
   }
 
   // ── PONDER ────────────────────────────────────────────────────────────────
@@ -1264,7 +1344,7 @@
     const fresh = makeJob(st);
     const live = E.job;
     live.ponder = false; live.hit = true; live.st = st;
-    live.movetime = fresh.budget; live.budget = fresh.budget; live.earlyStop = fresh.earlyStop; live.allowExtend = false;
+    live.movetime = fresh.budget; live.budget = fresh.budget; live.earlyStop = fresh.earlyStop; live.allowExtend = false; live.fight = fresh.fight;
     const elapsed = performance.now() - E.t0;
     dbg(`ponder hit after ${Math.round(elapsed)} ms`);
     clearTimeout(E.hitTimer);
@@ -1535,6 +1615,19 @@
       if (stored && stored.length) {                       // the opponent played a reply that was already searched
         cancelSearch();
         dbg('ponder hit (finished)');
+        const fresh = makeJob(st);
+        if (fresh.fight && fightDrawish(stored[0])) {
+          if (stored.length < 2) {                         // level and only one line: take a second look first
+            top3 = stored.map(e => Object.assign({}, e, { tentative: true }));
+            top3FEN = '';                                  // nothing is played until the second look is done
+            renderAllArrows(); updatePanel();
+            requestSearch(fightPassJob(fresh));
+            return;
+          }
+          const chosen = pickFighting(st, stored);
+          top3 = chosen; top3FEN = st.fen; finalize(st);
+          return;
+        }
         top3 = stored;
         top3FEN = st.fen;
         finalize(st);
@@ -2165,6 +2258,11 @@
     renderAllArrows();
     updatePanel();
   }
+  function toggleFight() {
+    playForWin = !playForWin;
+    store.set('eni-fight', playForWin ? 1 : 0);
+    if (pos && enabled) analyze(pos); else updatePanel();
+  }
   function toggleHidden() { if (panel?.isConnected) panel.style.display = panel.style.display === 'none' ? '' : 'none'; }
 
   function ensurePanel() {
@@ -2201,6 +2299,7 @@
           <button class="ef-btn" id="evilfish-toggle" title="Analyzer on / off (Alt+S: stealth)"></button>
           <button class="ef-btn" id="ef-auto" title="Auto move (Alt+A)">AUTO</button>
           <button class="ef-btn blue" id="ef-threats" title="Threat arrows (Alt+O)">THREATS</button>
+          <button class="ef-btn blue" id="ef-fight" title="Play for a win (Alt+W): in level positions avoid repetition and needless trades (100% tier)">WIN</button>
           <button class="ef-btn blue" id="ef-pre" title="Premove arrows and automatic premoves (Alt+M)">PREMOVE</button>
         </div>
         <div class="ef-grid">
@@ -2217,7 +2316,7 @@
     const q = id => panel.querySelector(id);
     ui = {
       bar: q('#ef-bar'), dot: q('#ef-dot'), mini: q('#ef-mini'), min: q('#ef-min'),
-      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'),
+      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'), fight: q('#ef-fight'),
       side: q('#ef-side'), evalbar: q('#ef-evalbar'), evalfill: q('#ef-evalfill'), evaltext: q('#ef-evaltext'),
       rows: q('#ef-rows'), extra: q('#ef-extra'), speed: q('#ef-speed'), tier: q('#ef-tier'),
       select: q('#evilfish-opening'), heart: q('#evilfish-heart'), label: q('#ef-open-label'),
@@ -2231,6 +2330,7 @@
     ui.auto.addEventListener('click', toggleAuto);
     ui.threats.addEventListener('click', toggleThreats);
     ui.pre.addEventListener('click', togglePremove);
+    ui.fight.addEventListener('click', toggleFight);
     ui.speed.addEventListener('change', () => setSpeed(Number(ui.speed.value)));
     ui.tier.addEventListener('change', () => setTier(Number(ui.tier.value)));
     panel.addEventListener('click', e => {
@@ -2298,7 +2398,7 @@
     const locked  = displayRank === i;
     const col     = COL_RANKS[i].replace(/0\.\d+\)/, '1)');
     const style   = `color:${col};${locked ? 'font-weight:bold;text-decoration:underline' : ''}`;
-    return `<span style="${style}">${symbols[i]}</span> ${esc(fmtMove(entry.move))} <span style="color:#aaa">${esc(fmtScore(entry))}</span>`;
+    return `<span style="${style}">${symbols[i]}</span> ${esc(fmtMove(entry.move))}${entry.fight ? ' ⚔' : ''} <span style="color:#aaa">${esc(fmtScore(entry))}</span>`;
   }
 
   const setOn = (el, on) => el.classList.toggle('on', !!on);
@@ -2322,6 +2422,8 @@
     setOn(ui.auto, autoMoveEnabled);
     setOn(ui.threats, showThreats);
     setOn(ui.pre, showPreMove);
+    setOn(ui.fight, playForWin);
+    ui.fight.style.opacity = TIERS[accuracyIdx].mode === 'max' ? '' : '.45';
     ui.min.textContent = uiState.min ? '+' : '–';
     ui.min.title = uiState.min ? 'Expand (Alt+N)' : 'Minimise (Alt+N)';
     panel.classList.toggle('ef-min', uiState.min);
@@ -2373,7 +2475,7 @@
       (currentOpening ? `<br><span style="color:#9ab">theory: ${esc(currentOpening)}</span>` : '');
     let engineLabel = E ? E.kind : '…';
     if (E && E.kind === 'lite' && /^full engine/.test(engineStatus)) engineLabel += ' → ' + engineStatus.replace(/^full engine:? ?/, 'full ');
-    ui.foot.innerHTML = `${esc(strengthLabel)} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
+    ui.foot.innerHTML = `${esc(strengthLabel)} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · W win · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
   }
 
   function setStatus(msg) { engineStatus = msg; updatePanel(); }
@@ -2429,7 +2531,7 @@
     if (e.getModifierState && e.getModifierState('AltGraph')) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-    if (e.repeat) { if (/^(KeyA|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
+    if (e.repeat) { if (/^(KeyA|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|KeyW|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
 
     switch (e.code) {
       case AUTO_MOVE_KEY: e.preventDefault(); toggleAuto(); break;
@@ -2446,6 +2548,7 @@
       case 'KeyX': e.preventDefault(); cancelQueuedPreMove(); break;
       case 'KeyO': e.preventDefault(); toggleThreats(); break;
       case 'KeyM': e.preventDefault(); togglePremove(); break;
+      case 'KeyW': e.preventDefault(); toggleFight(); break;
       case 'KeyS':
         e.preventDefault();
         if (!enabled) break;
@@ -2483,7 +2586,7 @@
            boardFromPlacement, placementFromBoard, legalCastlingRights, buildOpeningIndex, OPENINGS, makeJob, fmtScore,
            derivePreMoves, reconcileTablebase, onTablebase, setTablebase: t => { tablebase = t; }, readMyClockMs,
            normalizeCastlingPV, cloudEntries, cloud, useCloud, unsettled, startPonder, executeMove, clickMove, domPlacement,
-           hashKey, theory, theoryMoveFor, openingKey }
+           hashKey, theory, theoryMoveFor, openingKey, pickFighting, positionCounts, capturesInPV, fightDrawish, FIGHT }
     };
   }
   ensurePanel();
