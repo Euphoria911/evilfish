@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Evilfish
 // @namespace    https://chess.com
-// @version      4.1.0
-// @description  Stockfish 19 for chess.com: engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move
+// @version      4.2.0
+// @description  Stockfish 19 for chess.com: engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move, optional human-like play for the weaker strength tiers
 // @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
-  const VERSION       = '4.1.0';
+  const VERSION       = '4.2.0';
   const MULTI_PV      = 3;
   const AUTO_MOVE_KEY = 'KeyA';   // Alt+A
   const START_FEN     = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -169,7 +169,8 @@
   let showPreMove = true;
   let showThreats = true;
   let fightMode   = (() => { const v = Number(store.get('eni-fight', 1)); return v === 0 || v === 2 ? v : 1; })();   // 0 off · 1 focus · 2 risky
-  const counters  = { focus: 0, surprise: 0, unsettled: 0, risky: 0, ponderLive: 0, ponderStored: 0, results: 0 };   // test counters
+  const counters  = { focus: 0, surprise: 0, unsettled: 0, risky: 0, ponderLive: 0, ponderStored: 0, results: 0, human: 0 };   // test counters
+  let humanMode   = !!Number(store.get('eni-human', 0));   // human-like play for the weaker tiers (opt-in)
   let lastEvalMe  = null;     // my evaluation (centipawns, my point of view) from the previous search
   let displayRank = -1;
   let displayedOpeningSide = null;
@@ -952,7 +953,7 @@
 
   function applyStrength(E) {
     const t = TIERS[accuracyIdx];
-    if (t.mode === 'max') {
+    if (t.mode === 'max' || humanParams()) {
       send(E, 'setoption name UCI_LimitStrength value false');
       send(E, 'setoption name Skill Level value 20');
     } else if (t.mode === 'elo') {
@@ -1160,10 +1161,13 @@
     if (st.moves.length && !useMoves) dbg('move history inconsistent with FEN; searching from FEN only');
     const position = useMoves ? `position fen ${st.startFEN} moves ${st.moves.join(' ')}` : `position fen ${st.fen}`;
     const maxTier = tier.mode === 'max';
+    const H = humanParams();
+    if (H) { multiPV = H.k; movetime = 1500; }            // human-like: a short, shallow look at several candidates
     const budget = movetime;                               // what a fresh search of this position would get
     if (opts.ponder) movetime = 0;                         // speculative: runs until the opponent moves
     return {
-      st, fen: st.fen, position, multiPV, depth, movetime, budget,
+      human: !!H && meTurn, humanDepth: H ? H.d : 0,
+      st, fen: st.fen, position, multiPV, depth: H ? H.d : depth, movetime, budget,
       ponder: !!opts.ponder, extended: false,
       earlyStop: maxTier && budget > 0 && speed.name !== 'deep',
       fight: fightMode > 0 && maxTier && meTurn && !lowTime && !opts.ponder && budget > 0,
@@ -1176,7 +1180,8 @@
   function buildList(E, job, line) {
     const fen = job.fen;
     const side = turnOf(fen);
-    let list = Array.from({ length: MULTI_PV }, (_, k) => E.pv[k + 1])
+    const wanted = Math.max(MULTI_PV, job.multiPV || 0);
+    let list = Array.from({ length: wanted }, (_, k) => E.pv[k + 1])
       .filter(entry => entry && plausibleMove(fen, entry.move));
     const chosen = line.match(/^bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/)?.[1];
     if (chosen && plausibleMove(fen, chosen)) {
@@ -1184,8 +1189,121 @@
       if (index > 0) list.unshift(list.splice(index, 1)[0]);
       else if (index < 0) list.unshift({ move: chosen, pv: [chosen], scoreRaw: null, mateScore: null, wdl: null, label: '?' });
     }
-    list = list.slice(0, MULTI_PV).map(entry => Object.assign({}, entry, { side, tentative: false }));
+    list = list.slice(0, wanted).map(entry => Object.assign({}, entry, { side, tentative: false }));
     return reconcileTablebase(fen, list);
+  }
+
+  // ── HUMAN-LIKE PLAY ───────────────────────────────────────────────────────
+  // For the weaker tiers the engine can play like a person instead of like a strong engine with random noise:
+  //  · it only looks a few moves ahead (a shallow search), so tactics deeper than that are genuinely missed;
+  //  · it chooses among several reasonable candidates with a bias towards natural moves (captures, checks, castling);
+  //  · it usually notices a piece it is about to leave hanging, but not always, and notices less the weaker the tier;
+  //  · now and then it simply slips and plays a worse candidate.
+  // d = look-ahead depth, k = candidates considered, T = softness of the choice (cp), pb = chance of a slip,
+  // notice = chance of seeing that a move leaves a piece en prise. Tuned by engine-vs-engine matches (see the ladder below).
+  // A monotonic ladder (80% strongest), calibrated by engine-vs-engine matches against the 45% engine tier
+  // (Stockfish skill 4, depth 6) for 80-30%, and against the 30% engine tier for 30% and 20%.
+  // Roughly: 80% ≈ equal · 70% ≈ -150 · 60% ≈ -220 · 45% ≈ -270 · 30% ≈ -400 · 20% ≈ -550 (Elo, ±100).
+  const HUMAN = {
+    1: { d: 5, k: 5, T: 55,  pb: 0.012, notice: 0.97 },     // 80%
+    2: { d: 4, k: 5, T: 80,  pb: 0.020, notice: 0.93 },     // 70%
+    3: { d: 4, k: 6, T: 95,  pb: 0.030, notice: 0.90 },     // 60%
+    4: { d: 3, k: 6, T: 85,  pb: 0.035, notice: 0.85 },     // 45%
+    5: { d: 3, k: 7, T: 105, pb: 0.050, notice: 0.75 },     // 30%
+    6: { d: 2, k: 7, T: 130, pb: 0.080, notice: 0.60 }      // 20%
+  };
+  const PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 100 };
+
+  function humanParams() {
+    return humanMode && TIERS[accuracyIdx].mode !== 'max' ? HUMAN[accuracyIdx] || null : null;
+  }
+
+  // values of the pieces of side `by` that attack `square`, cheapest first
+  function attackersOf(pieces, square, by) {
+    const f = square.charCodeAt(0) - 97, r = +square[1] - 1;
+    const W = by === 'w';
+    const at = (df, dr) => {
+      const nf = f + df, nr = r + dr;
+      if (nf < 0 || nf > 7 || nr < 0 || nr > 7) return null;
+      return pieces[String.fromCharCode(97 + nf) + (nr + 1)] || '';
+    };
+    const own = lower => (W ? lower.toUpperCase() : lower);
+    const out = [];
+    for (const df of [-1, 1]) if (at(df, W ? -1 : 1) === own('p')) out.push(1);
+    for (const [df, dr] of [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]]) if (at(df, dr) === own('n')) out.push(3);
+    for (let df = -1; df <= 1; df++) for (let dr = -1; dr <= 1; dr++) if ((df || dr) && at(df, dr) === own('k')) out.push(100);
+    for (const [df, dr, diag] of [[1,1,1],[1,-1,1],[-1,1,1],[-1,-1,1],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]]) {
+      for (let k = 1; k < 8; k++) {
+        const p = at(df * k, dr * k);
+        if (p === null) break;
+        if (p) {
+          if (p === own('q')) out.push(9);
+          else if (diag && p === own('b')) out.push(3);
+          else if (!diag && p === own('r')) out.push(5);
+          break;
+        }
+      }
+    }
+    return out.sort((a, b) => a - b);
+  }
+
+  // the most material the side that just moved stands to lose on a single square (a hanging piece, or a trade
+  // that favours the opponent), measured in pawns
+  function hangingLoss(pieces, moverSide) {
+    const opp = moverSide === 'w' ? 'b' : 'w';
+    let worst = 0;
+    for (const sq of Object.keys(pieces)) {
+      const piece = pieces[sq];
+      if ((piece === piece.toUpperCase()) !== (moverSide === 'w')) continue;
+      const type = piece.toLowerCase();
+      if (type === 'k') continue;
+      const attackers = attackersOf(pieces, sq, opp);
+      if (!attackers.length) continue;
+      const defenders = attackersOf(pieces, sq, moverSide).length;
+      const v = PIECE_VALUE[type], a = attackers[0];
+      const loss = defenders === 0 ? v : (a < v ? v - a : 0);
+      if (loss > worst) worst = loss;
+    }
+    return worst;
+  }
+
+  function humanScore(entry, me) {
+    if (Number.isInteger(entry.mateScore)) return entry.mateScore > 0 ? 3000 - entry.mateScore * 20 : -3000 - entry.mateScore * 20;
+    return Number.isInteger(entry.scoreRaw) ? entry.scoreRaw : 0;
+  }
+
+  // list: engine lines (best first, side-to-move point of view) from a shallow search. Returns the list re-ordered so
+  // the human choice comes first (and flagged), the rest ordered by their adjusted score.
+  function humanPick(st, list, P, rnd = Math.random) {
+    if (!P || !list || list.length < 2) return list;
+    const side = turnOf(st.fen);
+    const before = boardFromPlacement(st.fen.split(' ')[0]);
+    const noticed = rnd() < P.notice;                      // does this move's "is anything hanging?" check happen?
+    const scored = list.map(e => {
+      let s = humanScore(e, side);
+      const from = e.move.slice(0, 2), to = e.move.slice(2, 4), piece = before[from] || '';
+      const after = Object.assign({}, before);
+      applyMove(after, e.move);
+      if (noticed) s -= 100 * 0.85 * hangingLoss(after, side);
+      if (before[to] || (/[pP]/.test(piece) && from[0] !== to[0])) s += 25;                            // captures
+      if (e.move[4]) s += 60;                                                                         // promotions
+      if (/[kK]/.test(piece) && Math.abs(to.charCodeAt(0) - from.charCodeAt(0)) === 2) s += 35;       // castling
+      if (kingAttackedBy(placementFromBoard(after), side === 'w' ? 'b' : 'w', side)) s += 10;         // checks
+      return { e, s };
+    });
+    const top = Math.max(...scored.map(x => x.s));
+    let pick;
+    if (rnd() < P.pb) {                                    // a slip: any of the reasonable candidates
+      const pool = scored.filter(x => x.s >= top - 400);
+      pick = pool[Math.floor(rnd() * pool.length)];
+    } else {
+      const weights = scored.map(x => Math.exp((x.s - top) / P.T));
+      let r = rnd() * weights.reduce((a, b) => a + b, 0);
+      pick = scored[weights.length - 1];
+      for (let i = 0; i < scored.length; i++) { r -= weights[i]; if (r <= 0) { pick = scored[i]; break; } }
+    }
+    const rest = scored.filter(x => x !== pick).sort((a, b) => b.s - a.s).map(x => x.e);
+    return [Object.assign({}, pick.e, { human: true })].concat(rest);
   }
 
   // ── PLAY FOR A WIN ────────────────────────────────────────────────────────
@@ -1263,6 +1381,17 @@
       return;
     }
     if (!pos || job.fen !== pos.fen) return;
+    if (job.human && list.length) {                    // human-like tier: pick like a person would
+      const P = humanParams();
+      const picked = P ? humanPick(job.st, list, P) : list;
+      top3 = picked.slice(0, MULTI_PV);
+      top3FEN = job.fen;
+      workerRestarts = 0;
+      counters.human++;
+      dbg(`human: ${picked[0].move} (engine ${list[0].move}) from ${list.length} lines at depth ${job.humanDepth}`);
+      finalize(job.st);
+      return;
+    }
     // the opponent's last move made things much worse than I expected: something tactical is going on, look longer
     const nowEval = Number.isInteger(list[0]?.scoreRaw) ? list[0].scoreRaw * (turnOf(job.fen) === mySide() ? 1 : -1) : null;
     const surprised = job.surpriseExtend && !job.extended && nowEval !== null && lastEvalMe !== null && nowEval - lastEvalMe < -80;
@@ -1310,7 +1439,7 @@
     const E = eng;
     if (!enabled || !E || !E.ready || st.over || !st.atEnd) return;
     if (st.mode && st.mode !== 'playing') return;
-    if (turnOf(st.fen) === mySide()) return;
+    if (turnOf(st.fen) === mySide() || humanParams()) return;
     const cands = [];
     for (const entry of list.slice(0, 3)) {
       const reply = entry?.pv?.[0];
@@ -1427,6 +1556,7 @@
   // choice but drop any move that throws the draw away.
   function onTablebase(fen) {
     if (!pos || pos.fen !== fen || !enabled || pos.over) return;
+    if (humanParams()) { updatePanel(); return; }          // a human-like player doesn't play perfect endgames
     const data = tablebase?.data;
     if (!data || !data.moves.length) return;
     if (TB_DECISIVE.has(data.category)) {
@@ -1447,6 +1577,7 @@
   }
 
   function reconcileTablebase(fen, list) {
+    if (humanParams()) return list;
     const data = tablebase?.fen === fen ? tablebase.data : null;
     if (!data || TB_DECISIVE.has(data.category) || data.category !== 'draw') return list;
     const keeps = new Set(data.moves.filter(m => m.category === 'draw').map(m => m.uci));
@@ -2278,6 +2409,13 @@
     store.set('eni-fight', fightMode);
     if (pos && enabled) analyze(pos); else updatePanel();
   }
+  function toggleHuman() {
+    humanMode = !humanMode;
+    store.set('eni-human', humanMode ? 1 : 0);
+    if (eng) eng.strengthDirty = true;
+    if (upgrade) upgrade.strengthDirty = true;
+    if (pos && enabled) analyze(pos); else updatePanel();
+  }
   function toggleHidden() { if (panel?.isConnected) panel.style.display = panel.style.display === 'none' ? '' : 'none'; }
 
   function ensurePanel() {
@@ -2315,6 +2453,7 @@
           <button class="ef-btn" id="ef-auto" title="Auto move (Alt+A)">AUTO</button>
           <button class="ef-btn blue" id="ef-threats" title="Threat arrows (Alt+O)">THREATS</button>
           <button class="ef-btn blue" id="ef-fight" title="Level positions (Alt+W): FOCUS thinks longer there and never plays a worse move; RISKY also avoids repetition and trades by playing slightly weaker moves (lost more games in my tests). 100% tier only."></button>
+          <button class="ef-btn blue" id="ef-human" title="Human-like play for the weaker strength tiers (Alt+U): limited look-ahead, natural moves, occasional slips">HUMAN</button>
           <button class="ef-btn blue" id="ef-pre" title="Premove arrows and automatic premoves (Alt+M)">PREMOVE</button>
         </div>
         <div class="ef-grid">
@@ -2331,7 +2470,7 @@
     const q = id => panel.querySelector(id);
     ui = {
       bar: q('#ef-bar'), dot: q('#ef-dot'), mini: q('#ef-mini'), min: q('#ef-min'),
-      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'), fight: q('#ef-fight'),
+      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'), fight: q('#ef-fight'), human: q('#ef-human'),
       side: q('#ef-side'), evalbar: q('#ef-evalbar'), evalfill: q('#ef-evalfill'), evaltext: q('#ef-evaltext'),
       rows: q('#ef-rows'), extra: q('#ef-extra'), speed: q('#ef-speed'), tier: q('#ef-tier'),
       select: q('#evilfish-opening'), heart: q('#evilfish-heart'), label: q('#ef-open-label'),
@@ -2346,6 +2485,7 @@
     ui.threats.addEventListener('click', toggleThreats);
     ui.pre.addEventListener('click', togglePremove);
     ui.fight.addEventListener('click', toggleFight);
+    ui.human.addEventListener('click', toggleHuman);
     ui.speed.addEventListener('change', () => setSpeed(Number(ui.speed.value)));
     ui.tier.addEventListener('change', () => setTier(Number(ui.tier.value)));
     panel.addEventListener('click', e => {
@@ -2438,6 +2578,8 @@
     setOn(ui.threats, showThreats);
     setOn(ui.pre, showPreMove);
     setOn(ui.fight, fightMode > 0);
+    setOn(ui.human, humanMode);
+    ui.human.style.opacity = TIERS[accuracyIdx].mode === 'max' ? '.45' : '';
     ui.fight.textContent = fightMode === 0 ? 'LEVEL: off' : fightMode === 1 ? 'LEVEL: focus' : 'LEVEL: risky';
     ui.fight.style.color = fightMode === 2 ? '#ffa500' : '';
     ui.fight.style.borderColor = fightMode === 2 ? '#ffa500' : '';
@@ -2493,7 +2635,7 @@
       (currentOpening ? `<br><span style="color:#9ab">theory: ${esc(currentOpening)}</span>` : '');
     let engineLabel = E ? E.kind : '…';
     if (E && E.kind === 'lite' && /^full engine/.test(engineStatus)) engineLabel += ' → ' + engineStatus.replace(/^full engine:? ?/, 'full ');
-    ui.foot.innerHTML = `${esc(strengthLabel)} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · W level mode · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
+    ui.foot.innerHTML = `${esc(strengthLabel)}${humanParams() ? ' · human-like' : ''} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · W level mode · U human · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
   }
 
   function setStatus(msg) { engineStatus = msg; updatePanel(); }
@@ -2549,7 +2691,7 @@
     if (e.getModifierState && e.getModifierState('AltGraph')) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-    if (e.repeat) { if (/^(KeyA|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|KeyW|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
+    if (e.repeat) { if (/^(KeyA|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|KeyW|KeyU|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
 
     switch (e.code) {
       case AUTO_MOVE_KEY: e.preventDefault(); toggleAuto(); break;
@@ -2567,6 +2709,7 @@
       case 'KeyO': e.preventDefault(); toggleThreats(); break;
       case 'KeyM': e.preventDefault(); togglePremove(); break;
       case 'KeyW': e.preventDefault(); toggleFight(); break;
+      case 'KeyU': e.preventDefault(); toggleHuman(); break;
       case 'KeyS':
         e.preventDefault();
         if (!enabled) break;
@@ -2598,13 +2741,14 @@
       get status() { return engineStatus; }, get counters() { return counters; }, get lastAutoMoveKey() { return lastAutoMoveKey; },
       get settings() { return { enabled, autoMoveEnabled, speed: SPEEDS[speedIdx].name, tier: TIERS[accuracyIdx].acc }; },
       set autoMove(v) { autoMoveEnabled = !!v; if (pos && enabled) analyze(pos); },
+      set human(v) { humanMode = !!v; if (eng) eng.strengthDirty = true; },
       set speed(i) { speedIdx = i; }, set accuracy(i) { accuracyIdx = i; if (eng) eng.strengthDirty = true; },
       sync: () => syncPosition('test'), analyze: () => pos && analyze(pos),
       T: { isValidFEN, plausibleMove, applyMove, stepFEN, inferMove, historyConsistent, squareAttacked, kingAttackedBy,
            boardFromPlacement, placementFromBoard, legalCastlingRights, buildOpeningIndex, OPENINGS, makeJob, fmtScore,
-           derivePreMoves, reconcileTablebase, onTablebase, setTablebase: t => { tablebase = t; }, readMyClockMs,
+           derivePreMoves, handleResult, buildList, applyStrength, reconcileTablebase, onTablebase, setTablebase: t => { tablebase = t; }, readMyClockMs,
            normalizeCastlingPV, cloudEntries, cloud, useCloud, unsettled, startPonder, executeMove, clickMove, domPlacement,
-           hashKey, theory, theoryMoveFor, openingKey, pickFighting, positionCounts, capturesInPV, fightDrawish, FIGHT }
+           hashKey, theory, theoryMoveFor, openingKey, humanPick, humanParams, HUMAN, hangingLoss, attackersOf, pickFighting, positionCounts, capturesInPV, fightDrawish, FIGHT }
     };
   }
   ensurePanel();
