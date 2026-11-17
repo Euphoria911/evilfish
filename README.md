@@ -109,3 +109,7 @@ both ladders in engine-vs-engine matches, and the human-like mode end to end in 
 
 Not verified: whether human-like play *feels* human (only its strength is measured), cloud evals and the
 low-clock branch (clock ≤ 25 s) under Tampermonkey, and LEVEL mode against strong online engines.
+
+## License
+
+[MIT](LICENSE)
