@@ -1,0 +1,15 @@
+{
+  "name": "evilfish",
+  "version": "4.2.1",
+  "private": true,
+  "description": "Stockfish 19 analyzer and auto-mover for chess.com (Tampermonkey userscript)",
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node test/helpers.test.js && node test/openings.test.js && node test/theory-book.test.js && node test/hanging.test.js && node test/human.test.js && node test/tiers.test.js",
+    "test:network": "node test/cloud-eval.test.js"
+  },
+  "devDependencies": {
+    "chess.js": "^1.4.0",
+    "stockfish": "19.0.1"
+  }
+}
