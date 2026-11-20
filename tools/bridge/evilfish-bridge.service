@@ -1,0 +1,16 @@
+# systemd --user unit: keeps the local engine bridge running.
+#   cp tools/bridge/evilfish-bridge.service ~/.config/systemd/user/ && systemctl --user enable --now evilfish-bridge
+# Edit WorkingDirectory to this project's path. Threads/hash can be set with Environment= lines.
+[Unit]
+Description=Evilfish local engine bridge
+
+[Service]
+WorkingDirectory=%h/Проекты/lmp-configs/userdata/projects/evilfish
+ExecStart=/usr/bin/node tools/bridge/evilfish-bridge.js
+Environment=EF_THREADS=12
+Environment=EF_HASH=256
+Restart=on-failure
+Nice=5
+
+[Install]
+WantedBy=default.target

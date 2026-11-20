@@ -13,15 +13,16 @@ function stubEl() {
 }
 
 function load(file, extra = {}) {
+  const board = extra.board; delete extra.board;       // optional fake <wc-chess-board> (with a .game) for clock/game-API tests
   const src = fs.readFileSync(file, 'utf8');
   const win = { __EF_TEST: true, addEventListener() {}, innerHeight: 800, innerWidth: 1400 };
   const sandbox = Object.assign({
     console: { log() {}, error: console.error, warn() {} },
     window: win,
     document: { createElement: stubEl, createElementNS: stubEl, body: { appendChild() {} }, head: { appendChild() {} }, getElementById: () => null, activeElement: null,
-                querySelector: () => null, querySelectorAll: () => [], addEventListener() {} },
+                querySelector: sel => (board && /wc-chess-board/.test(sel) ? board : null), querySelectorAll: () => [], addEventListener() {} },
     localStorage: { getItem: () => null, setItem() {} },
-    setTimeout, clearTimeout, setInterval: () => 0, queueMicrotask,
+    setTimeout, clearTimeout, setInterval: () => 0, queueMicrotask, performance,
     MutationObserver: class { observe() {} disconnect() {} },
     getComputedStyle: () => ({ position: 'relative' }),
     navigator: { deviceMemory: 8 }, crypto: globalThis.crypto,

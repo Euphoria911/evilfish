@@ -21,7 +21,9 @@ t('human on at 70%: shallow multi-line job', () => {
 t('human on at 100%: no effect', () => {
   ef.accuracy = 0;
   assert.strictEqual(T.humanParams(), null);
-  const j = T.makeJob(st); assert.ok(!j.human); assert.strictEqual(j.depth, 22);
+  const j = T.makeJob(st); assert.ok(!j.human);
+  assert.strictEqual(j.depth, 99, 'full strength with a clock budget: time decides the depth');
+  ef.speed = 2; const d = T.makeJob(st); assert.strictEqual(d.depth, 22, 'deep speed keeps the fixed depth'); ef.speed = 3;
 });
 t('every tier has parameters', () => {
   for (let i = 1; i <= 6; i++) { ef.accuracy = i; const P = T.humanParams(); assert.ok(P && P.d >= 2 && P.k >= 2 && P.T > 0, 'tier ' + i); }

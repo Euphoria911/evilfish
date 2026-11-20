@@ -1,0 +1,1 @@
+{"tc":"60+0","a":{"name":"new","bin":"multi","threads":4,"hash":256,"policy":"new","overhead":40},"b":{"name":"old","bin":"multi","threads":4,"hash":256,"policy":"old","overhead":40},"games":24,"W":2,"D":22,"L":0,"score":0.542,"eloA_minus_B":29,"ci95":[-9,68],"reasons":{"draw":8,"adj-draw":14,"mate":2},"flagsLostByA":0,"flagsLostByB":0,"avgMsPerMove":{"A":914,"B":948}}

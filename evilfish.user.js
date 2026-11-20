@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Evilfish
 // @namespace    https://chess.com
-// @version      4.2.1
-// @description  Stockfish 19 for chess.com: engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move, optional human-like play for the weaker strength tiers
+// @version      4.3.6
+// @description  Stockfish 19 for chess.com: optional local multi-thread engine bridge, engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move with human pacing, optional human-like play for the weaker strength tiers
 // @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @connect      127.0.0.1
+// @connect      localhost
 // @connect      unpkg.com
 // @connect      github.com
 // @connect      objects.githubusercontent.com
@@ -21,8 +23,13 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
-  const VERSION       = '4.2.1';
+  const VERSION       = '4.3.6';
   const MULTI_PV      = 3;
+  // Local engine bridge (tools/bridge/evilfish-bridge.js): a native or multi-thread Stockfish on this machine, reached
+  // through GM_xmlhttpRequest only. When it answers, the in-page WASM engine is never downloaded or started.
+  const BRIDGE_DEFAULT = 'http://127.0.0.1:8765';
+  const BRIDGE_PROBE_MS = 900;
+  const BRIDGE_REPROBE_MS = 20000;
   const AUTO_MOVE_KEY = 'KeyA';   // Alt+A
   const START_FEN     = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
   const START_PLACEMENT = START_FEN.split(' ')[0];
@@ -48,6 +55,8 @@
   };
   const ENGINE_CACHE = 'evilfish-engine-v1';
   const STOP_GRACE   = 2500;    // ms an engine gets to answer "stop" before it is considered dead
+  const STOP_GRACE_BRIDGE = 10000;   // a bridge engine can be slow on a loaded machine, and replacing it costs a whole new process
+  const stopGrace = E => (E && E.kind === 'bridge' ? STOP_GRACE_BRIDGE : STOP_GRACE);
 
   const COL_RANKS = [
     'rgba(0,  220, 80,  0.90)',
@@ -62,6 +71,13 @@
     { name: 'balanced', movetime: 800 },
     { name: 'deep',     movetime: 0   },   // fixed depth, soft-stopped after 20 s
     { name: 'auto',     movetime: -1  }    // clock-aware
+  ];
+  // Pacing: how long the move is held back after the answer is ready, so a move takes about as long as a person
+  // would take for it. 'scale' multiplies the modelled think time; 0 plays as soon as the answer is there.
+  const PACES = [
+    { name: 'off',     scale: 0    },
+    { name: 'natural', scale: 1    },
+    { name: 'quick',   scale: 0.55 }
   ];
   // Strength ladder. 'elo' is only the name shown in the menu; 'uci' is the UCI_Elo actually sent to the engine, and
   // 'skill' the Skill Level. The two Stockfish scales (UCI_Elo and Skill Level) don't line up, so the values were
@@ -130,7 +146,7 @@
   };
 
   const TEST = typeof window.__EF_TEST !== 'undefined';
-  const DEBUG = TEST || !!store.get('eni-debug', 0);
+  const DEBUG = TEST || !!Number(store.get('eni-debug', 0));
   function dbg(msg) { if (DEBUG) console.log('[Evilfish]', msg); }
   const safe = (fn, fallback = null) => { try { return fn(); } catch (e) { return fallback; } };
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -190,6 +206,16 @@
   let domFails    = { key: '', n: 0 };
   let previewTimer = null;
   let previewShown = false;
+  let previewFEN  = '';       // position the tentative (mid-search) arrows belong to
+  let posArrivedAt = 0;       // performance.now() when the current position was first seen
+  let paceIdx     = storedIndex('eni-pace', PACES.length, 1);
+  let paceState   = { fen: '', due: 0 };
+  let paceTimer   = null;
+  let humanTilt   = 0;        // plies left in which a human-like player is more error-prone after a slip
+  let bridgeState = { url: store.get('eni-bridge', BRIDGE_DEFAULT) || BRIDGE_DEFAULT, info: null, probing: false, lastProbe: 0 };
+  let upgrading   = false;
+  let incMs       = 0;        // increment per move, learned from the game's own clock record
+  let overheadMs  = 25;       // measured cost of one search round trip beyond its time limit (bridge, page)
   let tablebase   = null;
   const tablebaseCache = new Map();
 
@@ -400,8 +426,46 @@
     return `${np} ${side === 'w' ? 'b' : 'w'} ${legalCastlingRights(np, r)} ${ep} ${nh} ${nf}`;
   }
 
-  // The move (from `fen`) whose result has exactly `target` placement, or null.
+  // squares whose contents differ between two placements
+  function changedSquares(a, b) {
+    const A = boardFromPlacement(a), B = boardFromPlacement(b);
+    const out = [];
+    for (const sq of new Set(Object.keys(A).concat(Object.keys(B)))) if (A[sq] !== B[sq]) out.push(sq);
+    return out;
+  }
+
+  // The move (from `fen`) whose result has exactly `target` placement, or null. One move changes at most four squares
+  // (castling), and both ends of it are among them, so only those are tried.
   function inferMove(fen, target) {
+    const [placement, side] = fen.split(' ');
+    const diff = changedSquares(placement, target);
+    if (!diff.length || diff.length > 4) return null;
+    const pieces = boardFromPlacement(placement);
+    for (const from of diff) {
+      const piece = pieces[from];
+      if (!piece || isWhitePiece(piece) !== (side === 'w')) continue;
+      for (const to of diff) {
+        if (to === from) continue;
+        const rank = +to[1];
+        const promo = /[pP]/.test(piece) && (rank === 8 || rank === 1) ? ['q', 'r', 'b', 'n'] : [''];
+        for (const p of promo) {
+          const mv = from + to + p;
+          if (!plausibleMove(fen, mv)) continue;
+          const copy = Object.assign({}, pieces);
+          applyMove(copy, mv);
+          if (placementFromBoard(copy) === target) return mv;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Like inferMove, but also explains a board that is two plies ahead (a throttled background tab, or a premove and
+  // its reply landing between two polls). Returns the moves in order, or null. Every intermediate position has to be a
+  // valid FEN, so a first move that leaves its own king in check is never taken.
+  function inferMoves(fen, target) {
+    const one = inferMove(fen, target);
+    if (one) return [one];
     const [placement, side] = fen.split(' ');
     const pieces = boardFromPlacement(placement);
     for (const from of Object.keys(pieces)) {
@@ -414,9 +478,10 @@
         for (const p of promo) {
           const mv = from + to + p;
           if (!plausibleMove(fen, mv)) continue;
-          const copy = Object.assign({}, pieces);
-          applyMove(copy, mv);
-          if (placementFromBoard(copy) === target) return mv;
+          const next = stepFEN(fen, mv);
+          if (!next || !isValidFEN(next)) continue;
+          const second = inferMove(next, target);
+          if (second) return [mv, second];
         }
       }
     }
@@ -490,7 +555,46 @@
     const secs = match[3] ? (+match[1] * 3600 + +match[2] * 60 + +match[3]) : (+match[1] * 60 + +match[2]);
     return secs * 1000 + (match[4] ? +match[4] * 100 : 0);
   }
+  // The board's own clock objects hold the exact clock (about 100 ms resolution); the DOM only shows whole seconds
+  // above ten. Returns ms, or null when there is no running clock (untimed game, analysis, review).
+  function clockApi(g, side) {
+    const c = safe(() => g.clocks && g.clocks[side === 'w' ? 1 : 2] && g.clocks[side === 'w' ? 1 : 2].get());
+    if (!c || typeof c.currentTime !== 'number' || !(c.resetTime > 0)) return null;
+    return c.currentTime > 0 ? c.currentTime : null;
+  }
+  function readOppClockMs() {
+    const g = getGame();
+    const me = sideOf(safe(() => g?.getPlayingAs?.())) || (pos && pos.playingAs);
+    return g && me ? clockApi(g, me === 'w' ? 'b' : 'w') : null;
+  }
+
+  // Increment per move from the PGN's own clock comments: for each of my moves, clk = previous clk - spent + inc.
+  function learnIncrement() {
+    const g = getGame();
+    const me = sideOf(safe(() => g?.getPlayingAs?.()));
+    const pgn = safe(() => g?.getPGN?.());
+    if (!g || !me || typeof pgn !== 'string') return;
+    const re = /\{\[%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\](?:\s*\[%timestamp\s+(\d+)\])?\}/g;     // the PGN text is line-wrapped inside comments
+    const entries = [];
+    for (let m; (m = re.exec(pgn));) entries.push({ clk: (+m[1] * 3600 + +m[2] * 60 + +m[3]) * 1000, spent: m[4] !== undefined ? +m[4] * 100 : null });
+    const mine = entries.filter((_, i) => i % 2 === (me === 'w' ? 0 : 1));
+    const base = safe(() => g.clocks[me === 'w' ? 1 : 2].get().resetTime);
+    const samples = [];
+    for (let k = 0; k < mine.length; k++) {
+      const prev = k === 0 ? base : mine[k - 1].clk;
+      if (typeof prev !== 'number' || mine[k].spent === null) continue;
+      samples.push(mine[k].clk - (prev - mine[k].spent));
+    }
+    const last = samples.slice(-4).sort((a, b) => a - b);
+    if (last.length < 2) return;
+    const med = Math.round(last[last.length >> 1] / 100) * 100;
+    incMs = med >= 300 ? Math.min(60000, med) : 0;
+  }
+
   function readMyClockMs() {
+    const g = getGame();
+    const me = sideOf(safe(() => g?.getPlayingAs?.())) || (pos && pos.playingAs);
+    if (g && me) { const ms = clockApi(g, me); if (ms !== null) return ms; }
     // the player at the bottom of the board is always me, whichever way the board is turned
     let el = document.querySelector('.clock-component.clock-bottom, .clock-bottom, [class*="clock-bottom"]');
     if (!el) {
@@ -658,11 +762,13 @@
     if (domTrack.fen) {
       if (domTrack.fen.split(' ')[0] === placement) fen = domTrack.fen;
       else {
-        const mv = inferMove(domTrack.fen, placement);
-        if (mv) {
-          fen = stepFEN(domTrack.fen, mv);
-          domTrack.moves.push(mv);
-          domTrack.fen = fen;
+        const mvs = inferMoves(domTrack.fen, placement);
+        if (mvs) {
+          for (const mv of mvs) {
+            fen = stepFEN(domTrack.fen, mv);
+            domTrack.moves.push(mv);
+            domTrack.fen = fen;
+          }
         }
       }
     }
@@ -741,6 +847,10 @@
     const prev = pos;
     pos = st;
     lastFEN = st.fen;
+    if (!prev || prev.fen !== st.fen) {
+      posArrivedAt = performance.now(); cloud.gen++; if (humanTilt > 0) humanTilt--;
+      if (st.playingAs && turnOf(st.fen) === st.playingAs) learnIncrement();
+    }
     engineStatus = engineStatus.startsWith('variant') ? '' : engineStatus;
 
     const sameGame = prev && prev.startFEN === st.startFEN &&
@@ -749,7 +859,7 @@
       pendingPreMoves = [];
       currentOpening = '';
       lastEvalMe = null;
-      if (eng) eng.newGame = true;
+      if (eng) { eng.newGame = true; prewarmNewGame(eng); }
     }
     lastAutoMoveKey = '';
     dbg(`position (${st.source}/${reason}): ${st.fen} [${st.moves.length} plies]`);
@@ -870,7 +980,7 @@
         E.stopMode = 'accept';
         E.state = 'stopping';
         send(E, 'stop');
-        armWatchdog(E, STOP_GRACE);
+        armWatchdog(E, stopGrace(E));
       } else recoverEngine(E, `${E.state} timed out`);
     }, ms);
   }
@@ -885,7 +995,7 @@
   function recoverEngine(E, reason) {
     dbg(`recovering engine (${E.kind}): ${reason}`);
     killEngine(E);
-    if (E === upgrade) { upgrade = null; engineStatus = 'full engine failed; staying on lite'; updatePanel(); return; }
+    if (E === upgrade) { upgrade = null; engineStatus = E.kind === 'bridge' ? 'local engine failed; staying on the in-page one' : 'full engine failed; staying on lite'; updatePanel(); return; }
     if (E !== eng) return;
     eng = null;
     top3 = []; top3FEN = '';
@@ -894,33 +1004,177 @@
     updatePanel();
     clearTimeout(restartTimer);
     const delay = Math.min(500 * 2 ** Math.min(workerRestarts++, 5), 15000);
-    // come back on the same engine when its files are already cached; give up on "full" after repeated crashes
-    const kind = E.kind === 'full' && assets.full && workerRestarts <= 2 ? 'full' : 'lite';
-    restartTimer = setTimeout(() => startWorker(kind, 'active').catch(e => dbg('restart failed: ' + e)), delay);
+    // come back on the same engine when its files are already cached; give up on "full" after repeated crashes.
+    // The bridge is retried while it still answers a probe; otherwise the in-page engine takes over.
+    const kind = E.kind === 'bridge' ? 'bridge'
+               : E.kind === 'full' && assets.full && workerRestarts <= 2 ? 'full' : 'lite';
+    restartTimer = setTimeout(async () => {
+      try {
+        if (kind === 'bridge') {
+          if (await probeBridge()) { await startWorker('bridge', 'active'); return; }
+          dbg('bridge is gone; falling back to the in-page engine');
+          await startWorker('lite', 'active');
+          return;
+        }
+        await startWorker(kind, 'active');
+      } catch (e) { dbg('restart failed: ' + e); }
+    }, delay);
   }
 
-  async function startWorker(kind, role) {
-    const urls = await loadEngineAssets(kind);
+  // ── LOCAL ENGINE BRIDGE ───────────────────────────────────────────────────
+  // A small local server (tools/bridge/evilfish-bridge.js) owns a native or multi-thread Stockfish. This end is a pipe
+  // with the same two-way shape as a Worker: postMessage(command) in, onmessage(line) out. Everything goes through
+  // GM_xmlhttpRequest (the page's own network stack is never used), commands are batched per tick, and output comes
+  // back by long-polling a sequence number so no line is lost or repeated.
+  // Returns a promise with an abort(): the long poll has to be interruptible (see makeBridgePipe).
+  const bridgeCall = (method, path, body, timeout = 4000) => {
+    let handle = null, rejectIt = null;
+    const promise = new Promise((resolve, reject) => {
+      rejectIt = reject;
+      if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('GM_xmlhttpRequest unavailable'));
+      handle = GM_xmlhttpRequest({
+        method, url: bridgeState.url + path, data: body, timeout,
+        headers: { 'X-Evilfish': '1', 'Content-Type': 'text/plain' },
+        onload(res) {
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+          else reject(new Error(`bridge HTTP ${res.status}`));
+        },
+        onerror: () => reject(new Error('bridge unreachable')),
+        ontimeout: () => reject(new Error('bridge timeout')),
+        onabort: () => reject(Object.assign(new Error('aborted'), { aborted: true }))
+      });
+    });
+    promise.abort = () => { try { if (handle && handle.abort) handle.abort(); } catch (e) {} if (rejectIt) rejectIt(Object.assign(new Error('aborted'), { aborted: true })); };
+    return promise;
+  };
+
+  async function probeBridge() {
+    if (typeof GM_xmlhttpRequest !== 'function' || !Number(store.get('eni-bridge-on', 1))) return false;
+    bridgeState.lastProbe = Date.now();
+    try {
+      const info = JSON.parse(await bridgeCall('GET', '/hello', undefined, BRIDGE_PROBE_MS));
+      if (!info || info.name !== 'evilfish-bridge') return false;
+      bridgeState.info = info;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // Tampermonkey runs ONE GM_xmlhttpRequest at a time for the whole browser, across tabs, so a request that is held open
+  // blocks every other request in every tab until it returns (measured: another tab's 20 s idle poll delayed this tab's
+  // commands by 15 s, and each late `stop` tripped the watchdog). Hence:
+  //  - one request in flight per tab, carrying the pending commands and bringing back the output after `seq`;
+  //  - an empty request is a poll that the bridge holds for 1.5 s at most, and it is only made while a response is
+  //    actually expected (uciok, readyok, one bestmove per `go`); when the engine is idle nothing is in flight but a
+  //    small ping every 20 s that keeps the session alive;
+  //  - a poll in flight is aborted the moment there is a command to send (the bridge keeps unacknowledged lines, so an
+  //    abort never loses output);
+  //  - the id of the session is kept in sessionStorage, so a reloaded page takes over the same running engine.
+  async function makeBridgePipe() {
+    const prev = safe(() => sessionStorage.getItem('ef-bridge-sid'));
+    const sess = JSON.parse(await bridgeCall('POST', '/session' + (prev ? '?adopt=' + encodeURIComponent(prev) : ''), '', 15000));
+    safe(() => sessionStorage.setItem('ef-bridge-sid', sess.id));
+    const pipe = { id: sess.id, onmessage: null, onerror: null, closed: false, outBuf: [], seq: 0, idlePoll: null, expect: 0, wake: null };
+    const nudge = () => { const w = pipe.wake; pipe.wake = null; if (w) w(); };
+    pipe.postMessage = cmd => {
+      if (pipe.closed) return;
+      const text = String(cmd);
+      pipe.outBuf.push(text);
+      if (text === 'uci' || text === 'isready' || /^go(\s|$)/.test(text)) pipe.expect++;      // each of these is answered by exactly one line
+      const idle = pipe.idlePoll;
+      if (idle) { pipe.idlePoll = null; idle.abort(); }
+      nudge();
+    };
+    pipe.terminate = () => {
+      if (pipe.closed) return;
+      pipe.closed = true;
+      if (pipe.idlePoll) pipe.idlePoll.abort();
+      nudge();
+      safe(() => sessionStorage.removeItem('ef-bridge-sid'));
+      bridgeCall('DELETE', `/session?s=${pipe.id}`, undefined, 3000).catch(() => {});
+    };
+    (async () => {
+      let fails = 0;
+      while (!pipe.closed) {
+        let cmds = '';
+        if (!pipe.outBuf.length && pipe.expect <= 0) {                // idle: wait for a command, ping now and then
+          const ping = await new Promise(resolve => {
+            const t = setTimeout(() => { pipe.wake = null; resolve(true); }, 20000);
+            pipe.wake = () => { clearTimeout(t); resolve(false); };
+          });
+          if (pipe.closed) return;
+          if (ping && !pipe.outBuf.length && pipe.expect <= 0) {
+            try { await bridgeCall('GET', `/ping?s=${pipe.id}`, undefined, 4000); fails = 0; }
+            catch (e) { if (++fails >= 3) { pipe.closed = true; if (pipe.onerror) pipe.onerror({ message: String((e && e.message) || e) }); return; } }
+            continue;
+          }
+        }
+        cmds = pipe.outBuf.splice(0).join('\n');
+        const call = bridgeCall('POST', `/x?s=${pipe.id}&since=${pipe.seq}`, cmds, cmds ? 8000 : 8000);
+        if (!cmds) pipe.idlePoll = call;
+        try {
+          const res = JSON.parse(await call);
+          if (pipe.idlePoll === call) pipe.idlePoll = null;
+          fails = 0;
+          pipe.seq = res.seq;
+          for (const line of res.lines) {
+            if (pipe.closed || !pipe.onmessage) break;
+            if (line === 'uciok' || line === 'readyok' || line.startsWith('bestmove')) pipe.expect = Math.max(0, pipe.expect - 1);
+            // an error in a handler is the script's problem, not the transport's: it must neither drop the lines that follow
+            // nor count as a failed request (a swallowed bestmove here once stalled the whole game)
+            try { pipe.onmessage({ data: line }); } catch (e) { console.error('[Evilfish] engine message handler failed:', e && e.stack || e, 'on line:', String(line).slice(0, 120)); }
+          }
+          if (res.dead) throw new Error('engine process exited');
+        } catch (e) {
+          if (pipe.idlePoll === call) pipe.idlePoll = null;
+          if (pipe.closed) return;
+          if (e && e.aborted && !cmds) continue;                  // our own abort of the poll: go again with the command
+          if (cmds) pipe.outBuf.unshift(cmds);                    // the commands did not get through: send them again
+          if (++fails >= 3 || /exited/.test(String(e && e.message))) { pipe.closed = true; if (pipe.onerror) pipe.onerror({ message: String((e && e.message) || e) }); return; }
+          await new Promise(r => setTimeout(r, 150 * fails));
+        }
+      }
+    })();
+    return pipe;
+  }
+
+  // `ucinewgame` takes about half a second inside the engine (measured, independent of the hash size). Sending it when a new
+  // game is detected, rather than in front of the first real search, hides that time behind book moves and the opponent's turn.
+  function prewarmNewGame(E) {
+    if (!E || E.dead || !E.ready || E.state !== 'idle' || E.job || E.next) return false;
+    send(E, 'ucinewgame');
+    E.newGame = false;
+    return true;
+  }
+
+  async function startWorker(kind, role = 'active') {
     const E = {
       kind, worker: null, state: 'starting', ready: false, dead: false, timer: null,
       job: null, next: null, stopMode: null, pv: {}, hist: [], t0: 0, hitTimer: null, ponderResults: new Map(), ponderQueue: [], ponderIdx: 0, ponderPlan: [], ponderBase: "",
       multiPV: 0, newGame: true, strengthDirty: true
     };
-    E.worker = new Worker(urls.script + '#' + encodeURIComponent(urls.wasm));
-    E.worker.onmessage = ev => { if (!E.dead) onEngineMsg(E, ev.data); };
-    E.worker.onerror = ev => { if (!E.dead) recoverEngine(E, `worker error: ${ev.message} at ${ev.filename}:${ev.lineno}`); };
-    if (kind === 'full' && role !== 'active') upgrade = E; else eng = E;
+    if (kind === 'bridge') {
+      const pipe = await makeBridgePipe();
+      E.worker = pipe;
+      pipe.onmessage = ev => { if (!E.dead) onEngineMsg(E, ev.data); };
+      pipe.onerror = ev => { if (!E.dead) recoverEngine(E, `bridge error: ${ev.message}`); };
+    } else {
+      const urls = await loadEngineAssets(kind);
+      E.worker = new Worker(urls.script + '#' + encodeURIComponent(urls.wasm));
+      E.worker.onmessage = ev => { if (!E.dead) onEngineMsg(E, ev.data); };
+      E.worker.onerror = ev => { if (!E.dead) recoverEngine(E, `worker error: ${ev.message} at ${ev.filename}:${ev.lineno}`); };
+    }
+    if (role === 'upgrade') upgrade = E; else eng = E;
     send(E, 'uci');
     armWatchdog(E, kind === 'full' ? 90000 : 40000);
     return E;
   }
 
-  async function bootEngine() {
+  async function bootWasmEngine() {
     if (typeof crypto === 'undefined' || !crypto.subtle) { engineStatus = 'needs a secure context'; updatePanel(); return; }
     engineStatus = 'loading engine…';
     updatePanel();
     try {
-      await startWorker('lite');
+      await startWorker('lite', 'active');
     } catch (e) {
       dbg('engine boot failed: ' + e);
       engineStatus = 'engine fetch failed; retrying…';
@@ -929,31 +1183,51 @@
     }
   }
 
+  async function bootEngine() {
+    engineStatus = 'looking for the local engine…';
+    updatePanel();
+    if (await probeBridge()) {
+      try {
+        await startWorker('bridge', 'active');
+        dbg(`bridge engine: ${JSON.stringify(bridgeState.info)}`);
+        return;
+      } catch (e) { dbg('bridge start failed: ' + e); }
+    }
+    await bootWasmEngine();
+  }
+
+  // While the in-page engine runs, keep looking for a bridge; when one appears it is swapped in like the full build.
+  async function maybeUpgradeToBridge() {
+    if (upgrade || upgrading || !eng || eng.kind === 'bridge' || !eng.ready) return;
+    if (Date.now() - bridgeState.lastProbe < BRIDGE_REPROBE_MS) return;
+    if (!(await probeBridge())) return;
+    upgrading = true;
+    try { await startWorker('bridge', 'upgrade'); dbg('bridge appeared; swapping in'); }
+    catch (e) { dbg('bridge upgrade failed: ' + e); }
+    finally { upgrading = false; }
+  }
+
   async function upgradeEngine() {
+    if (upgrade || upgrading || (eng && eng.kind === 'bridge')) return;
     if (!store.get('eni-full-engine', 1) || (navigator.deviceMemory && navigator.deviceMemory < 4)) return;
+    upgrading = true;
     try {
       engineStatus = 'full engine: downloading…';
+      updatePanel();
       let lastPct = -1;
-      const files = ENGINE_FILES.full;
       const onProgress = (loaded, total) => {
         const pct = total ? Math.floor(100 * loaded / total) : Math.floor(loaded / 1e6);
         if (pct !== lastPct) { lastPct = pct; engineStatus = total ? `full engine: ${pct}%` : `full engine: ${pct} MB`; updatePanel(); }
       };
-      if (!assets.full) {
-        const [js, wasm] = await Promise.all([engineAsset(files.js), engineAsset(files.wasm, onProgress)]);
-        assets.full = {
-          script: URL.createObjectURL(new Blob([js], { type: 'application/javascript' })),
-          wasm: URL.createObjectURL(new Blob([wasm], { type: 'application/wasm' }))
-        };
-      }
+      await loadEngineAssets('full', onProgress);
       engineStatus = 'full engine: starting…';
       updatePanel();
-      await startWorker('full');
+      await startWorker('full', 'upgrade');
     } catch (e) {
       dbg('full engine unavailable: ' + e);
       engineStatus = 'full engine unavailable; using lite';
       updatePanel();
-    }
+    } finally { upgrading = false; }
   }
 
   function applyStrength(E) {
@@ -978,7 +1252,9 @@
     if (/ (lowerbound|upperbound)\b/.test(line)) return null;
     const mpv = +(line.match(/ multipv (\d+)/)?.[1] || 1);
     const score = line.match(/ score (cp|mate) (-?\d+)/);
-    const pv = line.match(/ pv (.+)$/)[1].trim().split(' ');
+    const pvMatch = line.match(/ pv (\S.*)$/);
+    if (!pvMatch) return null;                       // an `info ... pv` line with no moves (seen from the engine): nothing to keep
+    const pv = pvMatch[1].trim().split(' ');
     const wdl = line.match(/ wdl (\d+) (\d+) (\d+)/);
     const depth = +(line.match(/^info depth (\d+)/)?.[1] || 0);
     E.pv[mpv] = {
@@ -1009,7 +1285,7 @@
     E.stopMode = 'accept';
     E.state = 'stopping';
     send(E, 'stop');
-    armWatchdog(E, STOP_GRACE);
+    armWatchdog(E, stopGrace(E));
   }
 
   // Unsettled search (best move still changing, or score still falling): worth a bit more time.
@@ -1026,7 +1302,7 @@
     if (TEST) { (E.log = E.log || []).push(line.slice(0, 160)); if (E.log.length > 80) E.log.shift(); }
     if (line === 'uciok') {
       armWatchdog(E, E.kind === 'full' ? 90000 : 40000);
-      send(E, `setoption name Hash value ${E.kind === 'full' ? 128 : 64}`);
+      send(E, `setoption name Hash value ${E.kind === 'bridge' ? 1024 : E.kind === 'full' ? 128 : 64}`);   // the bridge clamps it to its own limit
       send(E, 'setoption name UCI_ShowWDL value true');
       send(E, `setoption name MultiPV value ${MULTI_PV}`);
       E.multiPV = MULTI_PV;
@@ -1044,13 +1320,13 @@
         const old = eng;
         eng = E; upgrade = null;
         killEngine(old);
-        engineStatus = 'full engine ✓';
+        engineStatus = E.kind === 'bridge' ? 'local engine ✓' : 'full engine ✓';
         workerRestarts = 0;
         if (pos && enabled && !pos.over) analyze(pos);
         else updatePanel();
         return;
       }
-      engineStatus = E.kind === 'full' ? 'full engine ✓' : 'engine ready ✓';
+      engineStatus = E.kind === 'bridge' ? 'local engine ✓' : E.kind === 'full' ? 'full engine ✓' : 'engine ready ✓';
       if (!upgrade && E.kind === 'lite' && workerRestarts < 3) setTimeout(upgradeEngine, 1500);
       if (pos && enabled && !pos.over) analyze(pos); else updatePanel();
       return;
@@ -1070,6 +1346,10 @@
       clearTimeout(previewTimer);
       previewTimer = null;
       const job = E.job;
+      if (job && job.movetime > 0 && !E.stopMode && !job.ponder) {        // a search that ran to its time limit: the excess is overhead
+        const over = performance.now() - E.t0 - job.movetime;
+        if (over >= 0 && over < 400) overheadMs = Math.round(0.8 * overheadMs + 0.2 * over);
+      }
       const accept = E.stopMode !== 'supersede';
       E.job = null;
       E.stopMode = null;
@@ -1090,6 +1370,7 @@
     const side = turnOf(E.job.fen);
     top3 = entries.map(entry => Object.assign({}, entry, { side, tentative: true }));
     previewShown = true;
+    previewFEN = E.job.fen;                               // top3FEN stays empty, so nothing is ever played from a preview
     renderAllArrows();
     updatePanel();
   }
@@ -1103,7 +1384,7 @@
       E.stopMode = 'supersede';
       E.state = 'stopping';
       send(E, 'stop');
-      armWatchdog(E, STOP_GRACE);
+      armWatchdog(E, stopGrace(E));
     }
   }
 
@@ -1115,7 +1396,7 @@
       E.stopMode = 'supersede';
       E.state = 'stopping';
       send(E, 'stop');
-      armWatchdog(E, STOP_GRACE);
+      armWatchdog(E, stopGrace(E));
     }
   }
 
@@ -1130,6 +1411,7 @@
     E.t0 = performance.now();
     clearTimeout(E.hitTimer);
     previewShown = false;
+    if (previewFEN !== job.fen) previewFEN = '';
     if (E.strengthDirty) applyStrength(E);
     if (E.newGame) { send(E, 'ucinewgame'); E.newGame = false; }
     if (E.multiPV !== job.multiPV) {
@@ -1142,11 +1424,17 @@
     updatePanel();
   }
 
-  function autoMovetime(clockMs) {
-    if (clockMs === null) return 800;
-    if (clockMs < 8000) return 120;
-    if (clockMs < 20000) return 250;
-    return Math.max(300, Math.min(6000, Math.round(clockMs / 35)));
+  // How long to think about one move, from the clock. The share of what is left that this move may use (more moves are
+  // expected the earlier it is, and a long game is assumed once the clock is short), plus most of the increment, inside
+  // hard limits: never more than 12 % of the clock, never below 30 ms. Minus the measured round-trip overhead. With a
+  // 3200-level opponent that replies at once, a won game is lost on the clock long before the engine is the limit.
+  function moveBudget(left, inc = 0, plies = 0, overhead = overheadMs) {
+    if (left === null || left === undefined) return 800;
+    const mtg = left < 60000 ? 40 : Math.max(20, 45 - 0.3 * plies);
+    const reserve = Math.min(1500, 300 + left * 0.02);
+    const share = Math.max(0, left - reserve) / mtg + inc * 0.7;
+    const cap = Math.min(8000, left * 0.12 + inc * 0.5);
+    return Math.round(Math.max(30, Math.min(share, cap) - overhead));
   }
 
   function makeJob(st, opts = {}) {
@@ -1156,9 +1444,12 @@
     const speed = SPEEDS[speedIdx];
     const clockMs = readMyClockMs();
     const lowTime = clockMs !== null && clockMs <= 25000;
-    let movetime = speed.movetime < 0 ? autoMovetime(clockMs) : speed.movetime;
-    if (lowTime && movetime !== 0) movetime = Math.min(movetime, 250);
-    if (!meTurn && movetime > 1200) movetime = 1200;      // opponent's clock is ticking; this only predicts
+    const budgetNow = moveBudget(clockMs, incMs, (st.moves || []).length);
+    let movetime = speed.movetime < 0 ? budgetNow : speed.movetime;
+    // every speed obeys the clock: a fixed time per move or an open-ended search must not cost the game
+    if (clockMs !== null) movetime = movetime === 0 ? Math.round(budgetNow * 2.5) : Math.min(movetime, budgetNow);
+    const roomy = clockMs === null || clockMs > 45000;        // enough clock for a second look, an extension, a focus pass
+    if (!meTurn && movetime > 1200) movetime = 1200;      // the opponent's clock is ticking; this only predicts
     let multiPV = MULTI_PV;
     if ((speed.name === 'fast' && meTurn) || lowTime || (meTurn && autoMoveEnabled)) multiPV = 1;
     const depth = meTurn ? tier.depth : Math.max(6, tier.depth);
@@ -1172,13 +1463,15 @@
     if (opts.ponder) movetime = 0;                         // speculative: runs until the opponent moves
     return {
       human: !!H && meTurn, humanDepth: H ? H.d : 0,
-      st, fen: st.fen, position, multiPV, depth: H ? H.d : depth, movetime, budget,
+      // full strength with a clock budget: the time decides how deep it gets (a fixed depth 22 cut long searches short,
+      // and the last ponder step never kept deepening); fixed depth stays for the weaker tiers and the "deep" speed
+      st, fen: st.fen, position, multiPV, depth: H ? H.d : (maxTier && budget > 0 ? 99 : depth), movetime, budget,
       ponder: !!opts.ponder, extended: false,
       earlyStop: maxTier && budget > 0 && speed.name !== 'deep',
-      fight: fightMode > 0 && maxTier && meTurn && !lowTime && !opts.ponder && budget > 0,
-      surpriseExtend: maxTier && meTurn && !lowTime && !opts.ponder && budget > 0 && speed.name !== 'deep',
+      fight: fightMode > 0 && maxTier && meTurn && roomy && !lowTime && !opts.ponder && budget > 0,
+      surpriseExtend: maxTier && meTurn && roomy && !lowTime && !opts.ponder && budget > 0 && speed.name !== 'deep',
       extendFactor: 0.7,
-      allowExtend: maxTier && meTurn && budget > 0 && speed.name !== 'fast' && speed.name !== 'deep' && !lowTime && !opts.ponder
+      allowExtend: maxTier && meTurn && roomy && budget > 0 && speed.name !== 'fast' && speed.name !== 'deep' && !lowTime && !opts.ponder
     };
   }
 
@@ -1279,7 +1572,14 @@
 
   // list: engine lines (best first, side-to-move point of view) from a shallow search. Returns the list re-ordered so
   // the human choice comes first (and flagged), the rest ordered by their adjusted score.
-  function humanPick(st, list, P, rnd = Math.random) {
+  // Errors are not evenly spread: they come more often when the clock is short and in clusters after a slip.
+  // pbMul scales the chance of a slip for the current move.
+  function humanContext(clockMs = readMyClockMs()) {
+    const pressure = clockMs === null ? 0 : Math.max(0, Math.min(1, (45000 - clockMs) / 45000));
+    return { pbMul: (1 + 1.5 * pressure) * (humanTilt > 0 ? 1.8 : 1) };
+  }
+
+  function humanPick(st, list, P, rnd = Math.random, ctx = {}) {
     if (!P || !list || list.length < 2) return list;
     const side = turnOf(st.fen);
     const before = boardFromPlacement(st.fen.split(' ')[0]);
@@ -1297,8 +1597,9 @@
       return { e, s };
     });
     const top = Math.max(...scored.map(x => x.s));
-    let pick;
-    if (rnd() < P.pb) {                                    // a slip: any of the reasonable candidates
+    let pick, slipped = false;
+    if (rnd() < P.pb * (ctx.pbMul || 1)) {                 // a slip: any of the reasonable candidates
+      slipped = true;
       const pool = scored.filter(x => x.s >= top - 400);
       pick = pool[Math.floor(rnd() * pool.length)];
     } else {
@@ -1308,7 +1609,7 @@
       for (let i = 0; i < scored.length; i++) { r -= weights[i]; if (r <= 0) { pick = scored[i]; break; } }
     }
     const rest = scored.filter(x => x !== pick).sort((a, b) => b.s - a.s).map(x => x.e);
-    return [Object.assign({}, pick.e, { human: true })].concat(rest);
+    return [Object.assign({}, pick.e, { human: true, slip: slipped && pick.s < top })].concat(rest);
   }
 
   // ── PLAY FOR A WIN ────────────────────────────────────────────────────────
@@ -1380,6 +1681,7 @@
   function handleResult(E, job, line) {
     const list = buildList(E, job, line);
     if (job.ponder) {                       // finished before the opponent moved: keep it for the hit
+      list.ms = Math.round(performance.now() - E.t0);       // how long this answer was searched, for the top-up on a hit
       E.ponderResults.set(job.fen, list);
       dbg(`ponder done (${E.kind}) for ${job.fen.slice(0, 40)}…`);
       if (job.ponderBase && job.ponderBase === E.ponderBase) { E.ponderIdx++; runPonder(E); }
@@ -1388,7 +1690,8 @@
     if (!pos || job.fen !== pos.fen) return;
     if (job.human && list.length) {                    // human-like tier: pick like a person would
       const P = humanParams();
-      const picked = P ? humanPick(job.st, list, P) : list;
+      const picked = P ? humanPick(job.st, list, P, Math.random, humanContext()) : list;
+      if (picked[0] && picked[0].slip) humanTilt = 6;      // a slip makes the next few moves shakier too
       top3 = picked.slice(0, MULTI_PV);
       top3FEN = job.fen;
       workerRestarts = 0;
@@ -1465,7 +1768,7 @@
     E.ponderIdx = 0;
     E.ponderPlan = [];
     for (const pass of PONDER_PASSES) useful.forEach((c, i) => E.ponderPlan.push([i, pass[i] || pass[pass.length - 1]]));
-    E.ponderPlan.push([0, 0]);                              // then keep deepening the most likely reply
+    E.ponderPlan.push([0, 8000]);                           // then keep deepening the most likely reply, for a while (not for ever: 12 threads at 100 % while the opponent thinks)
     E.ponderResults = new Map();
     if (useful.length) runPonder(E);
   }
@@ -1484,7 +1787,7 @@
     E.stopMode = mode;
     E.state = 'stopping';
     send(E, 'stop');
-    armWatchdog(E, STOP_GRACE);
+    armWatchdog(E, stopGrace(E));
   }
 
   // The opponent played the predicted move while the speculative search is still running: turn it into the real
@@ -1566,7 +1869,9 @@
     if (!data || !data.moves.length) return;
     if (TB_DECISIVE.has(data.category)) {
       const side = turnOf(fen);
-      const entries = data.moves.slice(0, MULTI_PV)
+      // only moves as good as the best one: a second arrow that throws the win away must not be labelled a win
+      const bestCategory = data.moves[0].category;
+      const entries = data.moves.filter(m => m.category === bestCategory).slice(0, MULTI_PV)
         .filter(m => plausibleMove(fen, m.uci))
         .map(m => ({ move: m.uci, pv: [m.uci], scoreRaw: null, mateScore: null, wdl: null, label: tbLabel(data, m), side, tentative: false, tb: true }));
       if (!entries.length) return;
@@ -1596,49 +1901,77 @@
   // ── CLOUD EVAL (full-strength tier only) ──────────────────────────────────
   // Lichess' cloud database holds very deep evaluations (typically depth 35-60) for most opening and common
   // middlegame positions. Weaker tiers never use it, so their strength stays exactly what the tier says.
-  const cloud = { cache: new Map(), pending: new Map(), blockedUntil: 0, timer: null };
+  // One request at a time (lichess asks API users for that, and answers 429 otherwise). The position being played is
+  // fetched first; warm-ups for the opponent's likely replies wait their turn and are dropped once they are stale.
+  const cloud = { cache: new Map(), pending: new Map(), queue: [], busy: false, gen: 0, blockedUntil: 0, timer: null };
 
   function cloudEligible(st) {
     if (TIERS[accuracyIdx].mode !== 'max' || st.moves.length > 70 || Date.now() < cloud.blockedUntil) return false;
     if (typeof GM_xmlhttpRequest !== 'function') return false;
     const clock = readMyClockMs();
-    return clock === null || clock > 15000;
+    return clock === null || clock > 90000;     // short games: the local engine is as good and never waits for the network
   }
 
+  function settleCloud(rec, value, blockMs) {
+    if (rec.done) return;
+    rec.done = true;
+    cloud.pending.delete(rec.fen);
+    if (value !== undefined) {
+      cloud.cache.set(rec.fen, value);
+      if (cloud.cache.size > 300) cloud.cache.delete(cloud.cache.keys().next().value);
+    }
+    if (blockMs) cloud.blockedUntil = Date.now() + blockMs;
+    for (const cb of rec.cbs) safe(() => cb(value));
+  }
+
+  function pumpCloud() {
+    while (!cloud.busy && cloud.queue.length) {
+      let i = -1;
+      for (let k = cloud.queue.length - 1; k >= 0; k--) if (cloud.queue[k].urgent) { i = k; break; }
+      const rec = cloud.queue.splice(i >= 0 ? i : 0, 1)[0];
+      if (rec.gen !== cloud.gen || Date.now() < cloud.blockedUntil) { settleCloud(rec, undefined); continue; }   // stale or blocked
+      cloud.busy = true;
+      sendCloud(rec);
+    }
+  }
+
+  function sendCloud(rec) {
+    const done = (value, blockMs) => { cloud.busy = false; settleCloud(rec, value, blockMs); pumpCloud(); };
+    try {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: 'https://lichess.org/api/cloud-eval?multiPv=3&fen=' + encodeURIComponent(rec.fen),
+        headers: { Accept: 'application/json' },
+        timeout: 2500,
+        onload(res) {
+          if (res.status === 200) {
+            try {
+              const data = JSON.parse(res.responseText);
+              done(data && Array.isArray(data.pvs) && data.pvs.length ? data : null);
+            } catch (e) { done(null); }
+          } else if (res.status === 404) done(null);
+          else if (res.status === 429) done(undefined, 60000);
+          else done(undefined, 15000);
+        },
+        onerror() { done(undefined, 15000); },
+        ontimeout() { done(undefined, 5000); }
+      });
+    } catch (e) { done(undefined, 15000); }
+  }
+
+  // onDone given -> the caller waits for the answer, so the lookup jumps the queue. No callback -> a warm-up.
   function lookupCloud(fen, onDone) {
     const cached = cloud.cache.get(fen);
     if (cached !== undefined) { if (onDone) safe(() => onDone(cached)); return; }
     const waiting = cloud.pending.get(fen);
-    if (waiting) { if (onDone) waiting.cbs.push(onDone); return; }
-    const rec = { t: performance.now(), cbs: onDone ? [onDone] : [] };
+    if (waiting) {
+      if (onDone) { waiting.cbs.push(onDone); waiting.urgent = true; waiting.gen = cloud.gen; }
+      return;
+    }
+    const rec = { fen, t: performance.now(), cbs: onDone ? [onDone] : [], urgent: !!onDone, gen: cloud.gen, done: false };
     cloud.pending.set(fen, rec);
-    const finish = (value, blockMs) => {
-      cloud.pending.delete(fen);
-      if (value !== undefined) {
-        cloud.cache.set(fen, value);
-        if (cloud.cache.size > 300) cloud.cache.delete(cloud.cache.keys().next().value);
-      }
-      if (blockMs) cloud.blockedUntil = Date.now() + blockMs;
-      for (const cb of rec.cbs) safe(() => cb(value));
-    };
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url: 'https://lichess.org/api/cloud-eval?multiPv=3&fen=' + encodeURIComponent(fen),
-      headers: { Accept: 'application/json' },
-      timeout: 2500,
-      onload(res) {
-        if (res.status === 200) {
-          try {
-            const data = JSON.parse(res.responseText);
-            finish(data && Array.isArray(data.pvs) && data.pvs.length ? data : null);
-          } catch (e) { finish(null); }
-        } else if (res.status === 404) finish(null);
-        else if (res.status === 429) finish(undefined, 60000);
-        else finish(undefined, 15000);
-      },
-      onerror() { finish(undefined, 15000); },
-      ontimeout() { finish(undefined, 5000); }
-    });
+    cloud.queue.push(rec);
+    pumpCloud();
   }
 
   // Lichess writes castling as king-takes-rook (e1h1); chess.com and the rest of this script use e1g1.
@@ -1767,6 +2100,21 @@
         cancelSearch();
         dbg('ponder hit (finished)'); counters.ponderStored++;
         const fresh = makeJob(st);
+        // a short ponder pass must not make the move weaker than a fresh search would have: show it as tentative and
+        // search on for the missing time (the table is warm), unless the answer is already as good as a fresh one
+        const missing = fresh.budget - (stored.ms || 0);
+        if (TIERS[accuracyIdx].mode === 'max' && !humanParams() && !fresh.human && fresh.budget > 0 && missing > 150) {
+          dbg(`ponder answer searched ${stored.ms} ms of ${fresh.budget}; topping up by ${missing} ms`);
+          counters.topup = (counters.topup || 0) + 1;
+          top3 = stored.map(e => Object.assign({}, e, { tentative: true }));
+          top3FEN = '';
+          previewFEN = st.fen;
+          previewShown = true;
+          renderAllArrows(); updatePanel();
+          fresh.movetime = Math.max(200, missing);
+          requestSearch(fresh);
+          return;
+        }
         if (fresh.fight && fightMode === 2 && fightDrawish(stored[0])) {
           if (stored.length < 2) {                         // level and only one line: take a second look first
             top3 = stored.map(e => Object.assign({}, e, { tentative: true }));
@@ -1794,6 +2142,74 @@
   function ensureAnalysis() {
     if (!enabled || !pos || pos.over || !eng || !eng.ready) return;
     if (eng.state === 'idle' && !eng.next && top3FEN !== pos.fen && !tbActiveFEN) analyze(pos);
+  }
+
+  // ── PACING ────────────────────────────────────────────────────────────────
+  // A move is held back until about as long after the position appeared as a person would take for it. The think
+  // time is modelled from the clock (roughly 1/45 of what is left, 0.5-9 s), scaled by the kind of move (book,
+  // forced, recapture, capture or check, quiet), the phase of the game, how close the top candidates are and how
+  // good the position is, then multiplied by log-normal noise with an occasional long think. Short clocks shrink it.
+  // Time already spent searching counts: an answer that took a second does not wait a full delay on top.
+  const gauss = rnd => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+
+  function moveKind(st, entry) {
+    if (!entry) return 'quiet';
+    if (/^(book|theory)/.test(entry.label || '')) return 'book';
+    if (entry.label === 'forced') return 'forced';
+    const move = entry.move;
+    if (!move || !RE_MOVE.test(move)) return 'quiet';
+    const board = boardFromPlacement(st.fen.split(' ')[0]);
+    const from = move.slice(0, 2), to = move.slice(2, 4), piece = board[from] || '';
+    const hist = st.moves || [];
+    const last = hist[hist.length - 1], prev = hist[hist.length - 2];
+    const capture = !!board[to] || (/[pP]/.test(piece) && from[0] !== to[0]);
+    // taking back on the square where the last two moves just traded is a reflex; any other capture is a decision
+    if (capture && last && prev && last.slice(2, 4) === to && prev.slice(2, 4) === to) return 'recapture';
+    if (capture) return 'capture';
+    const after = Object.assign({}, board);
+    applyMove(after, move);
+    const side = turnOf(st.fen);
+    if (kingAttackedBy(placementFromBoard(after), side === 'w' ? 'b' : 'w', side)) return 'capture';
+    return 'quiet';
+  }
+
+  // total think time (ms since the position appeared) for a move; 0 means "no pacing"
+  function paceTarget(kind, st, list = [], opts = {}) {
+    const rnd = opts.rnd || Math.random;
+    const scale = opts.scale !== undefined ? opts.scale : PACES[paceIdx].scale;
+    if (!scale) return 0;
+    const clock = opts.clockMs !== undefined ? opts.clockMs : readMyClockMs();
+    const left = clock === null ? 180000 : clock;
+    let base = Math.max(500, Math.min(9000, left / 45));
+    if (left < 10000) base = Math.min(base, 450);
+    else if (left < 25000) base = Math.min(base, 1200);
+    const plies = (st.moves || []).length;
+    const phase = plies < 16 ? 0.55 : plies > 70 ? 0.8 : 1;
+    const f = { book: 0.45, forced: 0.12, premove: 0.22, recapture: 0.35, capture: 0.8, quiet: 1 }[kind] ?? 1;
+    let sharp = 1;
+    const a = list[0], b = list[1];
+    if (a && Number.isInteger(a.scoreRaw) && !Number.isInteger(a.mateScore)) {
+      const mine = a.scoreRaw * (a.side === mySide() ? 1 : -1);
+      if (mine > 400) sharp *= 0.7;                 // clearly winning: plays on quickly
+      else if (mine < -300) sharp *= 1.1;
+      if (b && Number.isInteger(b.scoreRaw) && Math.abs(a.scoreRaw - b.scoreRaw) < 20) sharp *= 1.2;   // close call
+    }
+    let noise = Math.exp(0.45 * gauss(rnd));
+    noise = Math.max(0.35, Math.min(3, noise));
+    if (rnd() < 0.05) noise *= 2.2;                 // now and then a long think
+    let target = base * f * phase * sharp * noise * scale;
+    // pacing may never cost the game: at most 3 % of the clock (plus a little), nothing in a scramble
+    const cap = left * 0.03 + 40;
+    if (clock !== null && left < 3000) return 0;
+    target = Math.max(Math.min(kind === 'premove' ? 180 : 260, cap), target);
+    target = Math.min(target, cap, 20000);
+    return Math.round(target);
+  }
+
+  // ms still to wait before the move for `st` may be played
+  function paceRemaining(kind, st, list) {
+    if (paceState.fen !== st.fen) paceState = { fen: st.fen, due: posArrivedAt + paceTarget(kind, st, list) };
+    return paceState.due - performance.now();
   }
 
   // ── PREMOVES (conditional) ────────────────────────────────────────────────
@@ -1826,20 +2242,28 @@
   }
 
   function playPendingPreMove(st) {
-    if (!enabled || !pendingPreMoves.length) return false;
+    // arrows always show; the move itself is only played when auto move is on (a premove is still an automatic move)
+    if (!enabled || !autoMoveEnabled || !pendingPreMoves.length) return false;
     const placement = st.fen.split(' ')[0];
     const hit = pendingPreMoves.find(p => p.expect === placement);
     pendingPreMoves = [];
     if (!hit || !canAct(st) || !plausibleMove(st.fen, hit.move)) return false;
-    const how = executeMove(hit.move, st, 'premove');
     const key = st.fen + '|' + hit.move;
-    if (how && typeof how.then === 'function') {
-      lastAutoMoveKey = key;
-      how.then(ok => { if (!ok && lastAutoMoveKey === key) lastAutoMoveKey = ''; });
-      return true;
-    }
-    if (how) { lastAutoMoveKey = key; dbg(`premove (${hit.kind}) played via ${how}: ${hit.move}`); }
-    return !!how;
+    const run = () => {
+      if (!pos || pos.fen !== st.fen || !canAct(pos) || !autoMoveEnabled || lastAutoMoveKey !== key) return;
+      const how = executeMove(hit.move, st, 'premove');
+      if (how && typeof how.then === 'function') {
+        how.then(ok => { if (!ok && lastAutoMoveKey === key) lastAutoMoveKey = ''; });
+        return;
+      }
+      if (how) dbg(`premove (${hit.kind}) played via ${how}: ${hit.move}`);
+      else if (lastAutoMoveKey === key) lastAutoMoveKey = '';
+    };
+    const wait = paceRemaining('premove', st, []);
+    lastAutoMoveKey = key;                                  // claimed now, so nothing else plays this position meanwhile
+    if (wait > 12) { clearTimeout(paceTimer); paceTimer = setTimeout(run, wait); return true; }
+    run();
+    return lastAutoMoveKey === key;
   }
 
   function cancelQueuedPreMove() {
@@ -1867,6 +2291,12 @@
     if (wait > 0) {                       // a deeper cloud answer is about to arrive
       clearTimeout(cloud.timer);
       cloud.timer = setTimeout(playAutoMove, wait + 5);
+      return;
+    }
+    const hold = paceRemaining(moveKind(pos, top3[0]), pos, top3);
+    if (hold > 12) {                      // pacing: the answer is ready, the move is not due yet
+      clearTimeout(paceTimer);
+      paceTimer = setTimeout(playAutoMove, hold);
       return;
     }
     lastAutoMoveKey = key;
@@ -2151,6 +2581,10 @@
     if (svgLayer?.isConnected) return svgLayer;
     svgLayer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svgLayer.id = 'evilfish-arrows';
+    // drawn in a fixed 800x800 space (100 units per square) that the browser scales to the board, so the arrows stay
+    // correct when the layout changes without a window resize
+    svgLayer.setAttribute('viewBox', '0 0 800 800');
+    svgLayer.setAttribute('preserveAspectRatio', 'none');
     Object.assign(svgLayer.style, {
       position: 'absolute', inset: '0',
       width: '100%', height: '100%',
@@ -2165,7 +2599,7 @@
   function getBoardGeo() {
     const board = getBoard();
     if (!board) return null;
-    return { ox: 0, oy: 0, cell: board.getBoundingClientRect().width / 8 };
+    return board.getBoundingClientRect().width > 0 ? { ox: 0, oy: 0, cell: 100 } : null;
   }
 
   function sqCenter(sq, geo) {
@@ -2213,7 +2647,8 @@
   function renderAllArrows() {
     if (stealthMode) return;
     const svg = ensureSVG();
-    if (!svg || !top3.length || top3FEN !== lastFEN) return;
+    const tentative = previewFEN === lastFEN && !!top3[0]?.tentative;      // mid-search arrows, replaced by the final ones
+    if (!svg || !top3.length || (top3FEN !== lastFEN && !tentative)) return;
     clearArrows();
     const geo = getBoardGeo();
     if (!geo?.cell) return;
@@ -2421,6 +2856,14 @@
     if (upgrade) upgrade.strengthDirty = true;
     if (pos && enabled) analyze(pos); else updatePanel();
   }
+  function togglePace() {
+    paceIdx = (paceIdx + 1) % PACES.length;
+    store.set('eni-pace', paceIdx);
+    paceState = { fen: '', due: 0 };
+    clearTimeout(paceTimer);
+    updatePanel();
+    playAutoMove();
+  }
   function toggleHidden() { if (panel?.isConnected) panel.style.display = panel.style.display === 'none' ? '' : 'none'; }
 
   function ensurePanel() {
@@ -2459,7 +2902,8 @@
           <button class="ef-btn blue" id="ef-threats" title="Threat arrows (Alt+O)">THREATS</button>
           <button class="ef-btn blue" id="ef-fight" title="Level positions (Alt+W): FOCUS thinks longer there and never plays a worse move; RISKY also avoids repetition and trades by playing slightly weaker moves (lost more games in my tests). 100% tier only."></button>
           <button class="ef-btn blue" id="ef-human" title="Human-like play for the weaker strength tiers (Alt+U): limited look-ahead, natural moves, occasional slips">HUMAN</button>
-          <button class="ef-btn blue" id="ef-pre" title="Premove arrows and automatic premoves (Alt+M)">PREMOVE</button>
+          <button class="ef-btn blue" id="ef-pre" title="Premove arrows (Alt+M); with AUTO on, recaptures and forced mates are also played">PREMOVE</button>
+          <button class="ef-btn blue" id="ef-pace" title="Pacing (Alt+D): hold each automatic move back for a human think time. off / natural / quick"></button>
         </div>
         <div class="ef-grid">
           <label>speed (Alt+T)<select class="ef-sel" id="ef-speed">${speedOptions}</select></label>
@@ -2475,7 +2919,7 @@
     const q = id => panel.querySelector(id);
     ui = {
       bar: q('#ef-bar'), dot: q('#ef-dot'), mini: q('#ef-mini'), min: q('#ef-min'),
-      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'), fight: q('#ef-fight'), human: q('#ef-human'),
+      toggle: q('#evilfish-toggle'), auto: q('#ef-auto'), threats: q('#ef-threats'), pre: q('#ef-pre'), fight: q('#ef-fight'), human: q('#ef-human'), pace: q('#ef-pace'),
       side: q('#ef-side'), evalbar: q('#ef-evalbar'), evalfill: q('#ef-evalfill'), evaltext: q('#ef-evaltext'),
       rows: q('#ef-rows'), extra: q('#ef-extra'), speed: q('#ef-speed'), tier: q('#ef-tier'),
       select: q('#evilfish-opening'), heart: q('#evilfish-heart'), label: q('#ef-open-label'),
@@ -2491,6 +2935,7 @@
     ui.pre.addEventListener('click', togglePremove);
     ui.fight.addEventListener('click', toggleFight);
     ui.human.addEventListener('click', toggleHuman);
+    ui.pace.addEventListener('click', togglePace);
     ui.speed.addEventListener('change', () => setSpeed(Number(ui.speed.value)));
     ui.tier.addEventListener('change', () => setTier(Number(ui.tier.value)));
     panel.addEventListener('click', e => {
@@ -2584,6 +3029,8 @@
     setOn(ui.pre, showPreMove);
     setOn(ui.fight, fightMode > 0);
     setOn(ui.human, humanMode);
+    ui.pace.textContent = 'PACE: ' + PACES[paceIdx].name;
+    setOn(ui.pace, paceIdx > 0);
     ui.human.style.opacity = TIERS[accuracyIdx].mode === 'max' ? '.45' : '';
     ui.fight.textContent = fightMode === 0 ? 'LEVEL: off' : fightMode === 1 ? 'LEVEL: focus' : 'LEVEL: risky';
     ui.fight.style.color = fightMode === 2 ? '#ffa500' : '';
@@ -2638,9 +3085,9 @@
     const savedBlack = favoriteOpenings.b?.replace(/ \(Black\)$/, '') || 'none';
     ui.meta.innerHTML = `saved: W ${esc(savedWhite)} · B ${esc(savedBlack)}<br>playing: ${esc(OPENINGS[activeOpeningIndex()].name)} · book: ${lastFEN ? esc(openingStatus(lastFEN)) : 'waiting'}` +
       (currentOpening ? `<br><span style="color:#9ab">theory: ${esc(currentOpening)}</span>` : '');
-    let engineLabel = E ? E.kind : '…';
+    let engineLabel = !E ? '…' : E.kind === 'bridge' ? `local${bridgeState.info?.threads ? ' ' + bridgeState.info.threads + 't' : ''}` : E.kind;
     if (E && E.kind === 'lite' && /^full engine/.test(engineStatus)) engineLabel += ' → ' + engineStatus.replace(/^full engine:? ?/, 'full ');
-    ui.foot.innerHTML = `${esc(strengthLabel)}${humanParams() ? ' · human-like' : ''} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · W level mode · U human · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
+    ui.foot.innerHTML = `${esc(strengthLabel)}${humanParams() ? ' · human-like' : ''} · PV${E?.multiPV || MULTI_PV} · engine ${esc(engineLabel)}<br>Alt: A auto · D pace · W level mode · U human · T speed · P strength · O threats · M premoves · X cancel · S stealth · N minimise · H hide · F side · 1-3 arrow`;
   }
 
   function setStatus(msg) { engineStatus = msg; updatePanel(); }
@@ -2687,6 +3134,7 @@
     attachObserver(board);
     syncPosition('poll');
     ensureAnalysis();
+    maybeUpgradeToBridge();
     if (top3.length && renderedFlip !== null && renderedFlip !== isFlipped()) renderAllArrows();
   }
 
@@ -2696,7 +3144,7 @@
     if (e.getModifierState && e.getModifierState('AltGraph')) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-    if (e.repeat) { if (/^(KeyA|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|KeyW|KeyU|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
+    if (e.repeat) { if (/^(KeyA|KeyD|KeyF|KeyH|KeyN|KeyP|KeyT|KeyX|KeyO|KeyS|KeyM|KeyW|KeyU|Digit[123])$/.test(e.code)) e.preventDefault(); return; }
 
     switch (e.code) {
       case AUTO_MOVE_KEY: e.preventDefault(); toggleAuto(); break;
@@ -2715,6 +3163,7 @@
       case 'KeyM': e.preventDefault(); togglePremove(); break;
       case 'KeyW': e.preventDefault(); toggleFight(); break;
       case 'KeyU': e.preventDefault(); toggleHuman(); break;
+      case 'KeyD': e.preventDefault(); togglePace(); break;
       case 'KeyS':
         e.preventDefault();
         if (!enabled) break;
@@ -2742,7 +3191,7 @@
   // ── BOOT ──────────────────────────────────────────────────────────────────
   if (TEST) {
     window.__evilfish = {
-      get pos() { return pos; }, get top3() { return top3; }, get eng() { return eng; }, get pending() { return pendingPreMoves; },
+      get pos() { return pos; }, get top3() { return top3; }, get eng() { return eng; }, get pending() { return pendingPreMoves; }, set pos(v) { pos = v; }, get inc() { return incMs; }, get overhead() { return overheadMs; },
       get status() { return engineStatus; }, get counters() { return counters; }, get lastAutoMoveKey() { return lastAutoMoveKey; },
       get settings() { return { enabled, autoMoveEnabled, speed: SPEEDS[speedIdx].name, tier: TIERS[accuracyIdx].acc }; },
       set autoMove(v) { autoMoveEnabled = !!v; if (pos && enabled) analyze(pos); },
@@ -2750,7 +3199,7 @@
       set speed(i) { speedIdx = i; }, set accuracy(i) { accuracyIdx = i; if (eng) eng.strengthDirty = true; },
       sync: () => syncPosition('test'), analyze: () => pos && analyze(pos),
       T: { isValidFEN, plausibleMove, applyMove, stepFEN, inferMove, historyConsistent, squareAttacked, kingAttackedBy,
-           boardFromPlacement, placementFromBoard, legalCastlingRights, buildOpeningIndex, OPENINGS, makeJob, fmtScore,
+           boardFromPlacement, placementFromBoard, legalCastlingRights, buildOpeningIndex, OPENINGS, makeJob, fmtScore, inferMoves, parseInfo, prewarmNewGame, moveBudget, learnIncrement, readOppClockMs, paceTarget, moveKind, humanContext, lookupCloud, pumpCloud, playPendingPreMove, startWorker, requestSearch, bridgeState, probeBridge, makeBridgePipe, bridgeCall, bootEngine,
            derivePreMoves, handleResult, buildList, applyStrength, reconcileTablebase, onTablebase, setTablebase: t => { tablebase = t; }, readMyClockMs,
            normalizeCastlingPV, cloudEntries, cloud, useCloud, unsettled, startPonder, executeMove, clickMove, domPlacement,
            hashKey, theory, theoryMoveFor, openingKey, humanPick, humanParams, HUMAN, hangingLoss, attackersOf, pickFighting, positionCounts, capturesInPV, fightDrawish, FIGHT }

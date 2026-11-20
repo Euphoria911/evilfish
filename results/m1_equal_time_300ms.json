@@ -1,0 +1,1 @@
+{"tc":"movetime:300","a":{"name":"bridge-7t","bin":"multi","threads":7,"hash":512},"b":{"name":"page-full-1t","bin":"single","threads":1,"hash":128},"games":30,"W":11,"D":18,"L":1,"score":0.667,"eloA_minus_B":120,"ci95":[49,203],"reasons":{"adj-draw":13,"mate":12,"draw":5},"flagsLostByA":0,"flagsLostByB":0,"avgMsPerMove":{"A":299,"B":295}}

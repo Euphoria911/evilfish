@@ -12,6 +12,7 @@ searchable in the file.
 | DOM | board, side, flip and clock reading (`getGame`, `getBoard`, `readMyClockMs`, `domPlacement`) |
 | POSITION SOURCES | turns the page's game state (or, as a fallback, the DOM) into a validated position |
 | ENGINE ASSETS | downloads the pinned engine files, verifies SHA-256, caches them |
+| LOCAL ENGINE BRIDGE | `probeBridge`, `makeBridgePipe`: a Worker-shaped pipe over `GM_xmlhttpRequest` (batched commands, long-polled output) |
 | ENGINE | worker lifecycle, search jobs, watchdog, lite → full hot swap, result handling |
 | HUMAN-LIKE PLAY | `HUMAN` table, hanging-piece detector, `humanPick` |
 | PLAY FOR A WIN | LEVEL mode: `pickFighting`, focus pass |
@@ -20,6 +21,7 @@ searchable in the file.
 | CLOUD EVAL | lichess cloud evals, used at full strength only |
 | ANALYSIS | assembles the candidate list shown and played |
 | PREMOVES | conditional premoves |
+| PACING | `paceTarget`, `moveKind`, `paceRemaining`: how long a move is held back after the answer is ready |
 | MOVE EXECUTION | plays the move through the game API; DOM fallback tries a drag, then two clicks, and confirms the position changed |
 | OPENING BOOK / THEORY BOOK | repertoire lines per side; the packed engine-best theory book |
 | THREATS / SVG ARROWS | threat overlay and arrow rendering |
@@ -49,6 +51,10 @@ While it is the opponent's turn the engine ponders their likely replies (`runPon
 predicted reply can be answered from them. Pondering is off in human-like mode.
 
 ## Engine
+
+`bootEngine` first probes the local bridge (`tools/bridge`); if it answers, the engine is a bridge pipe (`kind: 'bridge'`,
+same message flow as a Worker) and no WASM is fetched. Otherwise the in-page builds below are used, and
+`maybeUpgradeToBridge` keeps probing so a late-started bridge is swapped in like the full build.
 
 Pinned Stockfish 19.0.1 builds from unpkg (GitHub releases as a mirror), verified against SHA-256 values in
 `ENGINE_FILES`. The lite build starts immediately; the full single-thread build (large net) downloads once in the
