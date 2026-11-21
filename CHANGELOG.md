@@ -1,5 +1,40 @@
 # Changelog
 
+## 4.3.7
+
+- **Fixed: duplicate moves and a missing score in the top three after a timed search.** When a search is stopped by its time
+  limit the engine prints a final snapshot of all MultiPV slots; slots can carry different depths (slot 1 at depth 22, slots 2
+  and 3 re-printed at 21) and slot 1 can end on a fail-high/low bound line, which was skipped. The final list took the last
+  *exact* line of each slot, so it could mix depths, repeat a move, and give the engine's own move no score (found when the new
+  bridge test failed on 4 of 12 runs against the native engine; then 1 of 12 after a first, wrong fix). The list is now the
+  engine's last line for each slot, bound lines included; exact lines still drive the live preview and the early stop. Tests
+  use real engine output; 36 stress runs on both engines: 0 bad.
+- Bridge 1.1 (native engine support), see below.
+
+## Bridge 1.1
+
+- **Native engine support.** The bridge now prefers a native `stockfish` (`--engine`, `EF_ENGINE`, `~/.local/share/evilfish/stockfish`,
+  `~/.local/bin/stockfish`, or on `PATH`) and falls back to the WASM build (`--wasm` forces it). `npm run engine:native`
+  installs the official Stockfish 19 Linux build without root, after checking the SHA-256 GitHub publishes for the release
+  asset. Measured on this laptop (i7-14650HX), native against the WASM build run by Node:
+
+  | | WASM | native |
+  |---|---|---|
+  | 1 thread | 0.46 Mnps | 1.16 Mnps |
+  | 12 threads | 4.15 Mnps | 9.44 Mnps |
+  | 24 threads | 5.23 Mnps | 11.27 Mnps |
+  | session start to `readyok` (12 threads) | 4-5 s | 0.3 s |
+  | `ucinewgame` + `isready` | 530 ms | 23 ms |
+  | resident memory per session | about 1.3 GB (256 MB hash) | about 0.6 GB (512 MB hash) |
+  | hash sizes | up to 1024 MB | 4096 MB works (140 ms to clear) |
+
+- **Strength, equal 300 ms per move, 30 games:** native engine on 7 threads against the in-page single-thread engine:
+  12 wins, 18 draws, 0 losses = **+147 Elo** (95 %: +79 to +228). The same match with the WASM engine on 7 threads gave +120
+  (+49 to +203); the intervals overlap, and drawish adjudication makes both figures floors (`results/m4_*`, `results/m1_*`).
+- Default hash is 512 MB for a native engine (256 MB for WASM); the installer no longer pins it.
+- `tools/bench.js` and `tools/strength_match.js` can run the native engine (`EF_ENGINE=...`, `bin: native`).
+- `npm test` runs the bridge suite against both engines.
+
 ## 4.3.6
 
 Found by running the script under the real Tampermonkey 5.5.1 (MV3, Chromium 157) in a separate profile, which the earlier

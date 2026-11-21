@@ -103,7 +103,17 @@ tools/bridge/install-service.sh remove
 
 Idle it costs about 20 MB and no CPU; an engine process only exists while a chess.com tab with the script is open.
 
-Measured on a 24-thread laptop (`npm run bench`): 1 thread 0.46 Mnps, 4: 1.7, 8: 3.1, **12: 4.2**, 16: 4.9, 24: 5.2, so 12
+For the best result install the native engine once (no root; the download is checked against GitHub's published SHA-256):
+
+```
+npm run engine:native            # official Stockfish 19 -> ~/.local/share/evilfish/stockfish
+systemctl --user restart evilfish-bridge
+```
+
+The bridge then uses it by itself: about 2.3x the nodes per second of the WASM build, a 0.3 s start instead of 4-5 s, about half
+the memory, and hash sizes above 1 GB (`EF_HASH`, `--hash`). Without it the WASM build is used.
+
+Measured on a 24-thread laptop (`npm run bench`; the figures below are the WASM engine, the native ones are in the changelog): 1 thread 0.46 Mnps, 4: 1.7, 8: 3.1, **12: 4.2**, 16: 4.9, 24: 5.2, so 12
 threads (the default) is the knee. A bridge round trip is about 1 ms and a 50 ms search overshoots by about 3 ms. Start-up
 is about 1.7 s plus 0.23 s per thread, which is why a reloaded page takes over the running engine instead of starting one.
 

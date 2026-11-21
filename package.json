@@ -1,15 +1,16 @@
 {
   "name": "evilfish",
-  "version": "4.3.6",
+  "version": "4.3.7",
   "private": true,
   "description": "Stockfish 19 analyzer and auto-mover for chess.com (Tampermonkey userscript) with an optional local multi-thread engine bridge",
   "license": "MIT",
   "scripts": {
-    "test": "node test/helpers.test.js && node test/openings.test.js && node test/theory-book.test.js && node test/hanging.test.js && node test/human.test.js && node test/tiers.test.js && node test/behaviour.test.js && node test/bridge.test.js",
+    "test": "node test/helpers.test.js && node test/openings.test.js && node test/theory-book.test.js && node test/hanging.test.js && node test/human.test.js && node test/tiers.test.js && node test/behaviour.test.js && EF_BRIDGE_WASM=1 node test/bridge.test.js && node test/bridge.test.js",
     "test:network": "node test/cloud-eval.test.js",
     "bridge": "node tools/bridge/evilfish-bridge.js",
     "bridge:install": "sh tools/bridge/install-service.sh",
-    "bench": "node tools/bench.js"
+    "bench": "node tools/bench.js",
+    "engine:native": "sh tools/bridge/install-native-engine.sh"
   },
   "devDependencies": {
     "chess.js": "^1.4.0",

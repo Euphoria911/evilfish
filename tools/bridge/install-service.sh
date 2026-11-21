@@ -2,7 +2,7 @@
 # Installs the bridge as a systemd user service that starts at login and restarts if it dies.
 #   tools/bridge/install-service.sh            install and start
 #   tools/bridge/install-service.sh remove     stop and remove
-# Settings: EF_THREADS (default 12), EF_HASH in MB (default 256; the WASM engine cannot use more than 1024).
+# Settings: EF_THREADS (default 12), EF_HASH in MB (default: 512 for a native engine, 256 for WASM; WASM cannot use more than 1024).
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 UNIT="$HOME/.config/systemd/user/evilfish-bridge.service"
@@ -21,7 +21,7 @@ Description=Evilfish local engine bridge
 WorkingDirectory=$ROOT
 ExecStart=$(command -v node) tools/bridge/evilfish-bridge.js
 Environment=EF_THREADS=${EF_THREADS:-12}
-Environment=EF_HASH=${EF_HASH:-256}
+${EF_HASH:+Environment=EF_HASH=$EF_HASH}
 Restart=on-failure
 Nice=5
 

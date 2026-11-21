@@ -36,9 +36,11 @@ const arg = (name, env, fallback) => {
 const PORT = Number(arg('port', 'EF_PORT', 8765));
 const HOST = '127.0.0.1';
 const THREADS = Math.max(1, Number(arg('threads', 'EF_THREADS', Math.min(12, Math.max(1, Math.floor(os.cpus().length / 2))))));
-// 256 MB: a 1 GB hash made every engine session about 2.1 GB resident (measured); on a 16 GB laptop with a browser open that
-// means swapping, a 6 s engine start and stop answers slower than the client's watchdog. 256 MB holds the nodes of a ~10 s search.
-let HASH_MB = Math.max(16, Number(arg('hash', 'EF_HASH', 256)));
+// Default hash: 256 MB for the WASM engine (a 1 GB hash made every session about 2.1 GB resident, measured: on a 16 GB laptop with a
+// browser open that means swapping, a 6 s engine start and stop answers slower than the client's watchdog), 512 MB for a native
+// engine (about 0.6 GB resident, and clearing it takes 20-50 ms). Both hold the nodes of a ~10 s search at these speeds.
+const HASH_ARG = arg('hash', 'EF_HASH', '');
+let HASH_MB = 256;
 const SYZYGY = arg('syzygy', 'EF_SYZYGY', '');
 const MAX_SESSIONS = Number(arg('sessions', 'EF_MAX_SESSIONS', 2));
 const IDLE_MS = 90000;                    // a live client pings at least every 20 s; an orphan is kept this long for the next page to adopt
@@ -51,11 +53,21 @@ const LOG_CMDS = !!arg('log-cmds', 'EF_LOG_CMDS', '');          // print accepte
 const ALLOW_ORIGIN = arg('allow-origin', 'EF_ALLOW_ORIGIN', '');     // testing only: lets a page call the bridge directly
 
 // ── engine selection ────────────────────────────────────────────────────────
+// Order: --engine / EF_ENGINE, then (unless --wasm / EF_WASM) a native `stockfish` on PATH or in ~/.local, then the WASM build.
+// A native engine does about 2.3x the nodes per second of the WASM build, starts in 25 ms instead of seconds, and uses about half
+// the memory (`npm run engine:native` installs the official release). Services have a minimal PATH, hence the home paths.
 function findEngine() {
   const wanted = arg('engine', 'EF_ENGINE', '');
   if (wanted) return { kind: 'native', cmd: wanted, args: [] };
-  const which = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['stockfish'], { encoding: 'utf8' });
-  if (which.status === 0 && which.stdout.trim()) return { kind: 'native', cmd: which.stdout.split('\n')[0].trim(), args: [] };
+  const forceWasm = process.argv.includes('--wasm') || !!process.env.EF_WASM;
+  if (!forceWasm) {
+    const home = os.homedir();
+    for (const c of [path.join(home, '.local', 'share', 'evilfish', 'stockfish'), path.join(home, '.local', 'bin', 'stockfish')]) {
+      try { fs.accessSync(c, fs.constants.X_OK); return { kind: 'native', cmd: c, args: [] }; } catch (e) {}
+    }
+    const which = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['stockfish'], { encoding: 'utf8' });
+    if (which.status === 0 && which.stdout.trim()) return { kind: 'native', cmd: which.stdout.split('\n')[0].trim(), args: [] };
+  }
   const roots = [path.join(__dirname, '..', '..'), process.cwd()];
   for (const root of roots) {
     const js = path.join(root, 'node_modules', 'stockfish', 'bin', 'stockfish-19.js');
@@ -64,6 +76,7 @@ function findEngine() {
   return null;
 }
 const ENGINE = findEngine();
+HASH_MB = Math.max(16, Number(HASH_ARG) || (ENGINE && ENGINE.kind === 'native' ? 512 : 256));
 // The WASM build cannot allocate more than about 1 GB of hash: asking for 2 GB makes it hang without a word (measured).
 if (ENGINE && ENGINE.kind === 'wasm' && HASH_MB > 1024) { console.log(`hash ${HASH_MB} MB is more than the WASM engine can allocate; using 1024`); HASH_MB = 1024; }
 

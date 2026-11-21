@@ -6,7 +6,7 @@
 //        --b '{"name":"page","bin":"single","threads":1,"hash":128,"policy":"auto","overhead":5}'
 //
 // --tc          'movetime:500' (fixed time per move, no clock) or '<base seconds>+<increment seconds>' (e.g. 60+0, 180+2)
-// side config   bin: multi | single | lite (the node_modules/stockfish builds); threads; hash (MB);
+// side config   bin: multi | single | lite (the node_modules/stockfish builds) | native (the official build, ~/.local/bin/stockfish); threads; hash (MB);
 //               policy: 'old' (clock/35, 4.2.x) | 'new' (moveBudget, 4.3.1) | 'native' (go wtime/btime/winc/binc);
 //               overhead: ms added to every move (stands in for the bridge round trip and the page);
 //               moveOverhead: the engine's own Move Overhead option (native policy)
@@ -29,7 +29,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 class Engine {
   constructor(cfg) {
     this.cfg = cfg;
-    this.p = spawn(process.execPath, ['--no-warnings', path.join(__dirname, '..', 'node_modules', 'stockfish', 'bin', BIN[cfg.bin])], { stdio: ['pipe', 'pipe', 'ignore'] });
+    // bin: multi | single | lite are the WASM builds run by Node; bin: native is the official build (EF_ENGINE or ~/.local/bin/stockfish)
+    this.p = cfg.bin === 'native'
+      ? spawn(process.env.EF_ENGINE || path.join(require('os').homedir(), '.local', 'bin', 'stockfish'), [], { stdio: ['pipe', 'pipe', 'ignore'] })
+      : spawn(process.execPath, ['--no-warnings', path.join(__dirname, '..', 'node_modules', 'stockfish', 'bin', BIN[cfg.bin])], { stdio: ['pipe', 'pipe', 'ignore'] });
     this.buf = ''; this.waiters = [];
     this.p.stdout.on('data', d => { this.buf += d; let i; while ((i = this.buf.indexOf('\n')) >= 0) { const l = this.buf.slice(0, i).trim(); this.buf = this.buf.slice(i + 1); for (const w of this.waiters.slice()) w(l); } });
   }
@@ -37,7 +40,7 @@ class Engine {
   until(test, on) { return new Promise(r => { const w = l => { if (on) on(l); if (test(l)) { this.waiters = this.waiters.filter(x => x !== w); r(l); } }; this.waiters.push(w); }); }
   async init() {
     this.send('uci'); await this.until(l => l === 'uciok');
-    if (this.cfg.bin === 'multi') this.send(`setoption name Threads value ${this.cfg.threads || 1}`);
+    if (this.cfg.bin === 'multi' || this.cfg.bin === 'native') this.send(`setoption name Threads value ${this.cfg.threads || 1}`);
     this.send(`setoption name Hash value ${this.cfg.hash || 128}`);
     this.send(`setoption name Move Overhead value ${this.cfg.moveOverhead ?? 10}`);
     this.send('isready'); await this.until(l => l === 'readyok');

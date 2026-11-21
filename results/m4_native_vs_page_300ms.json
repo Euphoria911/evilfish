@@ -1,0 +1,1 @@
+{"tc":"movetime:300","a":{"name":"native-7t","bin":"native","threads":7,"hash":256},"b":{"name":"page-full-1t","bin":"single","threads":1,"hash":128},"games":30,"W":12,"D":18,"L":0,"score":0.7,"eloA_minus_B":147,"ci95":[79,228],"reasons":{"adj-draw":14,"mate":12,"draw":4},"flagsLostByA":0,"flagsLostByB":0,"avgMsPerMove":{"A":293,"B":295}}

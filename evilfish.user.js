@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Evilfish
 // @namespace    https://chess.com
-// @version      4.3.6
+// @version      4.3.7
 // @description  Stockfish 19 for chess.com: optional local multi-thread engine bridge, engine-best opening theory (both colours, gambits and sidelines), your repertoires, cloud evals, pondering, event-driven board sync, tablebase, arrows, conditional premoves, auto move with human pacing, optional human-like play for the weaker strength tiers
 // @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
-  const VERSION       = '4.3.6';
+  const VERSION       = '4.3.7';
   const MULTI_PV      = 3;
   // Local engine bridge (tools/bridge/evilfish-bridge.js): a native or multi-thread Stockfish on this machine, reached
   // through GM_xmlhttpRequest only. When it answers, the in-page WASM engine is never downloaded or started.
@@ -1246,10 +1246,17 @@
     E.strengthDirty = false;
   }
 
+  // Two views of the engine's lines for one search:
+  //  - E.pv: the last EXACT line of every MultiPV slot. Drives the live preview and the early-stop history. Bound lines (the
+  //    aspiration window failing high or low) carry a truncated PV and a one-sided score, so they stay out.
+  //  - E.last: the last line of every slot, bound or not. When a timed search is stopped the engine prints a final snapshot of
+  //    all slots, and the slots can legitimately carry different depths (e.g. slot 1 at depth 22 and slots 2 and 3 at depth 21),
+  //    or slot 1 can end on a bound line. That snapshot is the engine's last word and what the final list is built from;
+  //    mixing "last exact line per slot" instead gave duplicate moves and a best move without a score.
+  function resetPv(E) { E.pv = {}; E.last = {}; }
+
   function parseInfo(E, line) {
     if (!/^info /.test(line) || !/ pv /.test(line) || !/ score /.test(line)) return null;
-    // aspiration-window bound lines carry truncated PVs; keep the last exact line instead
-    if (/ (lowerbound|upperbound)\b/.test(line)) return null;
     const mpv = +(line.match(/ multipv (\d+)/)?.[1] || 1);
     const score = line.match(/ score (cp|mate) (-?\d+)/);
     const pvMatch = line.match(/ pv (\S.*)$/);
@@ -1257,12 +1264,16 @@
     const pv = pvMatch[1].trim().split(' ');
     const wdl = line.match(/ wdl (\d+) (\d+) (\d+)/);
     const depth = +(line.match(/^info depth (\d+)/)?.[1] || 0);
-    E.pv[mpv] = {
+    const bound = / (lowerbound|upperbound)\b/.test(line);
+    const entry = {
       move: pv[0], pv, depth,
       scoreRaw: score[1] === 'cp' ? +score[2] : null,
       mateScore: score[1] === 'mate' ? +score[2] : null,
       wdl: wdl ? [+wdl[1], +wdl[2], +wdl[3]] : null
     };
+    (E.last = E.last || {})[mpv] = entry;
+    if (bound) return null;
+    E.pv[mpv] = entry;
     if (mpv === 1) {
       const v = +score[2];
       E.hist.push({ depth, move: pv[0], cp: score[1] === 'cp' ? v : (v > 0 ? 10000 - v : -10000 - v) });
@@ -1355,7 +1366,7 @@
       E.stopMode = null;
       E.state = 'idle';
       if (accept && job && !E.next) handleResult(E, job, line);
-      E.pv = {};
+      resetPv(E);
       if (E.next) runNext(E);
     }
   }
@@ -1406,7 +1417,7 @@
     if (!job) return;
     E.job = job;
     E.state = 'searching';
-    E.pv = {};
+    resetPv(E);
     E.hist = [];
     E.t0 = performance.now();
     clearTimeout(E.hitTimer);
@@ -1479,14 +1490,17 @@
     const fen = job.fen;
     const side = turnOf(fen);
     const wanted = Math.max(MULTI_PV, job.multiPV || 0);
-    let list = Array.from({ length: wanted }, (_, k) => E.pv[k + 1])
-      .filter(entry => entry && plausibleMove(fen, entry.move));
+    // the engine's final snapshot (E.last), falling back to the last exact lines
+    const slotsMap = E.last && Object.keys(E.last).length ? E.last : E.pv;
+    let list = Array.from({ length: wanted }, (_, k) => slotsMap[k + 1]).filter(entry => entry && plausibleMove(fen, entry.move));
     const chosen = line.match(/^bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/)?.[1];
     if (chosen && plausibleMove(fen, chosen)) {
       const index = list.findIndex(entry => entry.move === chosen);
       if (index > 0) list.unshift(list.splice(index, 1)[0]);
       else if (index < 0) list.unshift({ move: chosen, pv: [chosen], scoreRaw: null, mateScore: null, wdl: null, label: '?' });
     }
+    const seen = new Set();
+    list = list.filter(entry => !seen.has(entry.move) && seen.add(entry.move));
     list = list.slice(0, wanted).map(entry => Object.assign({}, entry, { side, tentative: false }));
     return reconcileTablebase(fen, list);
   }

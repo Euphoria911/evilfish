@@ -226,6 +226,52 @@ const rng = seed => () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let x = Mat
   });
 }
 
+// ── the top list after a search that was cut in the middle of a depth ──
+{
+  const { T } = load(file);
+  const start = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const fresh = () => ({ pv: {}, hist: [], last: {} });
+  const feed = (E, lines) => lines.forEach(l => T.parseInfo(E, l));
+  const L = (d, m, cp, pv, bound = '') => `info depth ${d} seldepth ${d + 10} multipv ${m} score cp ${cp}${bound} wdl 40 950 10 nodes 1 pv ${pv}`;
+  const moves = list => list.map(e => e.move);
+  // taken from real native-engine runs (threads 2, movetime 700, MultiPV 3)
+  t('final snapshot, slot 1 ends on a bound line: the engine\'s move first, with its score, no duplicates', () => {
+    const E = fresh();
+    feed(E, [L(21, 1, 23, 'd2d4 g8f6'), L(21, 2, 19, 'e2e4 e7e5'), L(21, 3, 19, 'g1f3 d7d5'), L(22, 1, 21, 'g1f3 d7d5', ' upperbound'), L(22, 2, 20, 'd2d4 g8f6'), L(22, 3, 19, 'e2e4 e7e5')]);
+    const list = T.buildList(E, { fen: start, multiPV: 3 }, 'bestmove g1f3 ponder d7d5');
+    assert.deepStrictEqual(moves(list), ['g1f3', 'd2d4', 'e2e4']);
+    assert.ok(list.every(e => e.depth > 0 && Number.isInteger(e.scoreRaw)), JSON.stringify(list.map(e => [e.move, e.depth, e.scoreRaw])));
+    assert.strictEqual(list[0].scoreRaw, 21);
+  });
+  t('final snapshot with slots at different depths (slot 1 at 22, slots 2 and 3 re-printed at 21)', () => {
+    const E = fresh();
+    feed(E, [L(21, 1, 26, 'g1f3 d7d5'), L(21, 2, 26, 'd2d4 g8f6'), L(21, 3, 26, 'e2e4 e7e5'), L(22, 1, 34, 'e2e4 e7e5'), L(21, 2, 26, 'g1f3 d7d5'), L(21, 3, 26, 'd2d4 g8f6')]);
+    const list = T.buildList(E, { fen: start, multiPV: 3 }, 'bestmove e2e4 ponder e7e5');
+    assert.deepStrictEqual(moves(list), ['e2e4', 'g1f3', 'd2d4']);
+    assert.deepStrictEqual(list.map(e => e.depth), [22, 21, 21]);
+  });
+  t('a normal complete search is used as it stands', () => {
+    const E = fresh();
+    feed(E, [L(22, 1, 25, 'e2e4 e7e5'), L(22, 2, 22, 'd2d4 d7d5'), L(22, 3, 20, 'g1f3 g8f6')]);
+    assert.deepStrictEqual(moves(T.buildList(E, { fen: start, multiPV: 3 }, 'bestmove e2e4')), ['e2e4', 'd2d4', 'g1f3']);
+  });
+  t('the early-stop history and the exact lines ignore bound lines', () => {
+    const E = fresh();
+    feed(E, [L(20, 1, 30, 'e2e4 e7e5'), L(21, 1, 31, 'd2d4 d7d5', ' lowerbound')]);
+    assert.strictEqual(E.pv[1].move, 'e2e4'); assert.strictEqual(E.hist.length, 1);
+    assert.strictEqual(E.last[1].move, 'd2d4');
+  });
+  t('fewer legal moves than lines asked for', () => {
+    const E = fresh(); feed(E, [L(10, 1, 50, 'e2e4'), L(10, 2, 10, 'd2d4')]);
+    assert.deepStrictEqual(moves(T.buildList(E, { fen: start, multiPV: 3 }, 'bestmove e2e4')), ['e2e4', 'd2d4']);
+  });
+  t('a bestmove that is in no line still goes first', () => {
+    const E = fresh(); feed(E, [L(20, 1, 30, 'e2e4 e7e5'), L(20, 2, 20, 'd2d4 d7d5'), L(20, 3, 10, 'g1f3 g8f6')]);
+    const list = T.buildList(E, { fen: start, multiPV: 3 }, 'bestmove b1c3');
+    assert.strictEqual(list[0].move, 'b1c3'); assert.strictEqual(list.length, 3);
+  });
+}
+
 // ── human context ──
 {
   const { T } = load(file);

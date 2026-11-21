@@ -24,7 +24,7 @@ let bad = 0;
 const ok = (name, cond, extra = '') => { console.log((cond ? 'ok   ' : 'FAIL ') + name + (cond ? '' : ' ' + extra)); if (!cond) bad++; };
 
 (async () => {
-  const bridge = spawn(process.execPath, [path.join(root, 'tools', 'bridge', 'evilfish-bridge.js'), '--port', String(PORT), '--threads', '2', '--hash', '32'],
+  const bridge = spawn(process.execPath, [path.join(root, 'tools', 'bridge', 'evilfish-bridge.js'), '--port', String(PORT), '--threads', '2', '--hash', '32'].concat(process.env.EF_BRIDGE_WASM ? ['--wasm'] : []),
     { stdio: ['ignore', 'pipe', 'pipe'] });
   let out = ''; bridge.stdout.on('data', d => out += d); bridge.stderr.on('data', d => out += d);
   try {
@@ -70,7 +70,7 @@ const ok = (name, cond, extra = '') => { console.log((cond ? 'ok   ' : 'FAIL ') 
 
     // ── session limit: orphans (a reloaded page) make room, live sessions do not ──
     const bridge2Port = PORT + 1;
-    const b2 = spawn(process.execPath, [path.join(root, 'tools', 'bridge', 'evilfish-bridge.js'), '--port', String(bridge2Port), '--threads', '1', '--hash', '16', '--sessions', '2', '--stale', '4000'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const b2 = spawn(process.execPath, [path.join(root, 'tools', 'bridge', 'evilfish-bridge.js'), '--port', String(bridge2Port), '--threads', '1', '--hash', '16', '--sessions', '2', '--stale', '4000'].concat(process.env.EF_BRIDGE_WASM ? ['--wasm'] : []), { stdio: ['ignore', 'pipe', 'pipe'] });
     try {
       const call2 = (method, p, body) => new Promise((resolve, reject) => {
         const req = http.request(`http://127.0.0.1:${bridge2Port}` + p, { method, headers: { 'X-Evilfish': '1' } }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d })); });

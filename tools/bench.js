@@ -10,8 +10,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const FEN = 'r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2P1PN2/PP1NBPPP/R2Q1RK1 w - - 0 9';
 const BIN = path.join(__dirname, '..', 'node_modules', 'stockfish', 'bin', 'stockfish-19.js');
 
+// EF_ENGINE=/path/to/native/stockfish benchmarks a native engine instead of the WASM build run by Node
 function engine() {
-  const p = spawn(process.execPath, ['--no-warnings', BIN], { stdio: ['pipe', 'pipe', 'ignore'] });
+  const p = process.env.EF_ENGINE ? spawn(process.env.EF_ENGINE, [], { stdio: ['pipe', 'pipe', 'ignore'] })
+                                  : spawn(process.execPath, ['--no-warnings', BIN], { stdio: ['pipe', 'pipe', 'ignore'] });
   let buf = ''; const waiters = [];
   p.stdout.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1); for (const w of waiters.slice()) w(l); } });
   const send = c => p.stdin.write(c + '\n');
